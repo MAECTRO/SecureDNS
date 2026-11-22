@@ -25,8 +25,9 @@
 1. Запустите `SecureDNS.exe` (Windows спросит права администратора — они нужны
    для смены системного DNS).
 2. Впишите IP своих DNS-серверов через запятую.
-3. Выберите протокол: DoT (порт 853) или DoH (укажите URL шаблона; IP сервера
-   в первом поле используется для прямого подключения к DoH без DNS-резолва).
+3. Выберите протокол: DoT (порт 853) или DoH (укажите URL шаблона; IP серверов
+   из первого поля используются для прямого подключения к DoH без DNS-резолва
+   с перебором при сбое).
 4. Для своих серверов по IP оставьте галочку «Проверять TLS-сертификат»
    выключенной. Если хотите строгую проверку в режиме DoT — впишите
    «Домен сертификата» (сертификат выпущен на домен, а не на IP).
@@ -110,7 +111,7 @@ pyinstaller --noconfirm --onefile --windowed --name SecureDNS main.py
 
 ```
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --uac-admin --name SecureDNS --icon icon.ico main.py
+pyinstaller --noconfirm --onefile --windowed --uac-admin --name SecureDNS --icon icon.ico --add-data "icon.ico;." main.py
 ```
 
 Готовый exe появится в `dist\SecureDNS.exe`. Зависимостей, кроме стандартной
