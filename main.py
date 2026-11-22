@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CREATE_NO_WINDOW = 0x08000000
 LOCAL_DNS = "127.0.0.1"
 BACKUP_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "SecureDNS")
@@ -197,21 +197,60 @@ class DoTUpstream:
 
 
 class DoHUpstream:
-    """DNS-over-HTTPS (RFC 8484): POST application/dns-message на указанный URL."""
+    """DNS-over-HTTPS (RFC 8484): POST application/dns-message на указанный URL.
 
-    def __init__(self, url: str, verify: bool = True, timeout: float = 6.0):
-        # url вида https://host[:port]/path
+    Решает «проблему курицы и яйца»: после переключения системного DNS на
+    локальный прокси резолвить имя DoH-сервера уже некому. Поэтому коннектимся
+    на заранее известный IP (bootstrap_ip или зарезолвленный до переключения),
+    а домен отправляем в TLS SNI и HTTP-заголовке Host — nginx поймёт маршрут.
+    """
+
+    def __init__(self, url: str, verify: bool = True,
+                 bootstrap_ip: str | None = None, timeout: float = 6.0):
         from urllib.parse import urlparse
         u = urlparse(url)
+        if not u.hostname:
+            raise ValueError("некорректный DoH URL")
         self.host = u.hostname
         self.port = u.port or 443
         self.path = u.path or "/dns-query"
+        if u.query:
+            self.path += "?" + u.query
         self.timeout = timeout
         self._ctx = make_ssl_context(verify, self.host)
+        self._ips = [bootstrap_ip] if bootstrap_ip else []
+        if not self._ips:
+            self._resolve()
+
+    def _resolve(self):
+        """Резолвим имя хоста, пока системный DNS ещё работает."""
+        try:
+            infos = socket.getaddrinfo(self.host, self.port, socket.AF_INET)
+            ips = sorted({i[4][0] for i in infos})
+            if ips:
+                self._ips = ips
+        except OSError:
+            pass  # оставляем прежние адреса
 
     def query(self, packet: bytes) -> bytes:
-        conn = http.client.HTTPSConnection(self.host, self.port,
-                                           timeout=self.timeout, context=self._ctx)
+        if not self._ips:
+            self._resolve()
+        last = None
+        for ip in self._ips or [self.host]:
+            try:
+                return self._query_via(ip, packet)
+            except Exception as e:  # noqa: BLE001
+                last = e
+        self._resolve()  # вдруг адрес сменился
+        raise IOError(f"DoH {self.host}: {last}")
+
+    def _query_via(self, ip: str, packet: bytes) -> bytes:
+        raw = socket.create_connection((ip, self.port), timeout=self.timeout)
+        raw.settimeout(self.timeout)
+        sock = self._ctx.wrap_socket(raw, server_hostname=self.host)
+        # HTTPConnection с готовым TLS-сокетом: Host-заголовок = домен
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        conn.sock = sock
         try:
             conn.request("POST", self.path, body=packet, headers={
                 "Content-Type": "application/dns-message",
@@ -455,11 +494,14 @@ class App(tk.Tk):
         # Серверы
         row = ttk.Frame(self)
         row.pack(fill="x", padx=16, pady=(10, 0))
-        ttk.Label(row, text="Ваши DNS-серверы (IP через запятую — любые):").pack(anchor="w")
+        self.lbl_ips = ttk.Label(row, text="Ваши DNS-серверы (IP через запятую — любые):")
+        self.lbl_ips.pack(anchor="w")
         self.ent_ips = ttk.Entry(row)
         self.ent_ips.pack(fill="x", pady=(4, 0))
-        ttk.Label(row, text="Порядок важен: при недоступности первого запросы уходят "
-                            "на следующий.", style="Muted.TLabel").pack(anchor="w")
+        self.lbl_ips_hint = ttk.Label(row, text="Порядок важен: при недоступности первого "
+                                                "запросы уходят на следующий.",
+                                      style="Muted.TLabel")
+        self.lbl_ips_hint.pack(anchor="w")
 
         # Протокол
         row = ttk.Frame(self)
@@ -541,8 +583,16 @@ class App(tk.Tk):
     def _on_proto(self):
         if self.var_proto.get() == "doh":
             self.ent_doh.pack(fill="x", pady=(4, 0))
+            self.lbl_ips.config(text="IP DoH-сервера (рекомендуется — прямое подключение "
+                                     "без DNS-резолва):")
+            self.lbl_ips_hint.config(
+                text="Домен из URL пойдёт в SNI/Host, коннект — напрямую на этот IP. "
+                     "Если оставить пустым, домен резолвится заранее.")
         else:
             self.ent_doh.pack_forget()
+            self.lbl_ips.config(text="Ваши DNS-серверы (IP через запятую — любые):")
+            self.lbl_ips_hint.config(text="Порядок важен: при недоступности первого "
+                                          "запросы уходят на следующий.")
 
     def _selected_adapter(self):
         i = self.cmb_adapter.current()
@@ -558,19 +608,24 @@ class App(tk.Tk):
 
     def _build_upstreams(self):
         ips = self._parse_ips()
-        if not ips:
+        if ips is None:
             messagebox.showerror(APP_NAME, "Впишите корректные IP-адреса через запятую,\n"
                                            "например: 9.9.9.9, 149.112.112.112")
             return None
         verify = self.var_verify.get()
         if self.var_proto.get() == "dot":
+            if not ips:
+                messagebox.showerror(APP_NAME, "Для DoT впишите хотя бы один IP сервера.")
+                return None
             return [DoTUpstream(ip, 853, verify=verify) for ip in ips], \
                    f"DoT:853 → {', '.join(ips)}"
         url = self.ent_doh.get().strip()
         if not url.startswith("https://"):
             messagebox.showerror(APP_NAME, "DoH-шаблон должен начинаться с https://")
             return None
-        return [DoHUpstream(url, verify=verify)], f"DoH → {url}"
+        bootstrap = ips[0] if ips else None
+        desc = f"DoH → {url}" + (f" (через {bootstrap})" if bootstrap else "")
+        return [DoHUpstream(url, verify=verify, bootstrap_ip=bootstrap)], desc
 
     # ---------- конфиг ----------
     def _load_config(self):
