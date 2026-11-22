@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -248,6 +248,36 @@ def flush_dns_cache():
 def adapter_key(a):
     """Идентификатор адаптера для DNS-операций: ifindex (Windows) или имя (Linux)."""
     return a["index"] if IS_WINDOWS else a["name"]
+
+
+def restore_adapter_dns(key):
+    """Вернуть DNS адаптера: из бэкапа, либо в DHCP. Возвращает (ok, описание)."""
+    backup = load_backup(key)
+    if backup and backup != [LOCAL_DNS]:
+        ok, err = set_dns_servers(key, backup)
+        if ok:
+            return True, f"восстановлены DNS: {', '.join(backup)}"
+        # бэкап не применился — уходим в DHCP как безопасный вариант
+        ok2, err2 = reset_dns_servers(key)
+        return ok2, ("бэкап не применился, DNS возвращён в авто (DHCP)"
+                     if ok2 else f"{err}; и DHCP не сработал: {err2}")
+    ok, err = reset_dns_servers(key)
+    return ok, ("DNS возвращён в авто (DHCP)" if ok else f"ошибка: {err}")
+
+
+def startup_rollback(log):
+    """Аварийный откат: если адаптер смотрит на 127.0.0.1, а прокси не запущен —
+    значит программу закрыли/убили с активной защитой. Возвращаем настройки."""
+    for a in get_adapters():
+        if get_dns_servers(adapter_key(a)) == [LOCAL_DNS]:
+            if not is_admin():
+                log(f"⚠ Адаптер «{a['name']}» смотрит на 127.0.0.1, но прокси не "
+                    f"запущен. Для отката нужны права — перезапустите: {admin_hint()}")
+                continue
+            ok, msg = restore_adapter_dns(adapter_key(a))
+            flush_dns_cache()
+            log(f"⚠ Обнаружен «зависший» DNS 127.0.0.1 на «{a['name']}» (программа "
+                f"была закрыта с активной защитой). Автооткат: {msg}")
 
 
 # Порт «замка» единственного экземпляра (не имеет отношения к DNS)
@@ -919,37 +949,11 @@ class App(tk.Tk):
         self._run_async(work)
 
     def _restore_adapter_dns(self, if_index: int):
-        """Вернуть DNS адаптера: из бэкапа, либо в DHCP. Возвращает описание."""
-        backup = load_backup(if_index)
-        if backup and backup != [LOCAL_DNS]:
-            ok, err = set_dns_servers(if_index, backup)
-            if ok:
-                return True, f"восстановлены DNS: {', '.join(backup)}"
-            # бэкап не применился — уходим в DHCP как безопасный вариант
-            ok2, err2 = reset_dns_servers(if_index)
-            return ok2, ("бэкап не применился, DNS возвращён в авто (DHCP)"
-                         if ok2 else f"{err}; и DHCP не сработал: {err2}")
-        ok, err = reset_dns_servers(if_index)
-        return ok, ("DNS возвращён в авто (DHCP)" if ok else f"ошибка: {err}")
+        return restore_adapter_dns(if_index)
 
     def _startup_rollback(self):
-        """Аварийный откат: если адаптер смотрит на 127.0.0.1, а прокси не запущен —
-        значит программу закрыли/убили с активной защитой. Возвращаем настройки."""
         def work():
-            for a in get_adapters():
-                dns = get_dns_servers(adapter_key(a))
-                if dns == [LOCAL_DNS]:
-                    if not is_admin():
-                        self.q.put(("log", f"⚠ Адаптер «{a['name']}» смотрит на 127.0.0.1, "
-                                           f"но прокси не запущен. Для отката нужны права — "
-                                           f"перезапустите программу: {admin_hint()}"))
-                        continue
-                    ok, msg = self._restore_adapter_dns(adapter_key(a))
-                    flush_dns_cache()
-                    self.q.put(("log", f"⚠ Обнаружен «зависший» DNS 127.0.0.1 на "
-                                       f"«{a['name']}» (программа была закрыта с активной "
-                                       f"защитой). Автооткат: {msg}"))
-                    self.q.put(("status", (a, get_dns_servers(adapter_key(a)))))
+            startup_rollback(self._thread_log)
         threading.Thread(target=work, daemon=True).start()
 
     def on_disable(self):
@@ -1040,7 +1044,182 @@ class App(tk.Tk):
         self.destroy()
 
 
+# ---------------------------------------------------------------------------
+# CLI-режим (для Linux без GUI / Wayland / серверов):  python3 main.py --cli
+# ---------------------------------------------------------------------------
+
+def _cli_input(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return val or default
+
+
+def _cli_build_upstreams():
+    """Спрашивает параметры у пользователя, возвращает (upstreams, описание)."""
+    ips_raw = _cli_input("Ваши DNS-серверы (IP через запятую)")
+    ips = [s.strip() for s in ips_raw.split(",") if s.strip()]
+    for ip in ips:
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            print(f"✘ Некорректный IP: {ip}")
+            return None
+    proto = _cli_input("Протокол: dot (порт 853) или doh (порт 443)", "dot").lower()
+    verify = _cli_input("Проверять TLS-сертификат сервера? (y/n)", "n").lower() == "y"
+    if proto == "dot":
+        if not ips:
+            print("✘ Для DoT нужен хотя бы один IP.")
+            return None
+        return [DoTUpstream(ip, 853, verify=verify) for ip in ips], \
+               f"DoT:853 → {', '.join(ips)}"
+    url = _cli_input("DoH-шаблон (https://.../dns-query)")
+    if not url.startswith("https://"):
+        print("✘ DoH-шаблон должен начинаться с https://")
+        return None
+    bootstrap = ips[0] if ips else None
+    desc = f"DoH → {url}" + (f" (через {bootstrap})" if bootstrap else "")
+    try:
+        return [DoHUpstream(url, verify=verify, bootstrap_ip=bootstrap)], desc
+    except ValueError as e:
+        print(f"✘ {e}")
+        return None
+
+
+def cli_main():
+    print(f"{APP_NAME} {APP_VERSION} — шифрованный DNS (режим командной строки)")
+    print("Для графического режима запустите без параметра --cli\n")
+    if not is_admin():
+        print(f"✘ Нужны права root. Запустите: sudo python3 main.py --cli")
+        return 1
+    startup_rollback(print)
+    proxy = None
+    active = None
+
+    def show_status():
+        ads = get_adapters()
+        if not ads:
+            print("Активных адаптеров не найдено.")
+        for a in ads:
+            dns = get_dns_servers(adapter_key(a))
+            mark = " ← через SecureDNS" if dns == [LOCAL_DNS] else ""
+            print(f"  {a['name']} ({a['desc']}): {', '.join(dns) or 'авто (DHCP)'}{mark}")
+        print(f"  Прокси: {'работает на 127.0.0.1:53' if proxy else 'остановлен'}")
+
+    def enable():
+        nonlocal proxy, active
+        ads = get_adapters()
+        if not ads:
+            print("✘ Нет активных адаптеров.")
+            return
+        print("Адаптеры:")
+        for i, a in enumerate(ads, 1):
+            print(f"  {i}) {a['name']} — {a['desc']}")
+        choice = _cli_input("Номер адаптера", "1")
+        if not choice.isdigit() or not (1 <= int(choice) <= len(ads)):
+            print("✘ Неверный номер.")
+            return
+        a = ads[int(choice) - 1]
+        built = _cli_build_upstreams()
+        if not built:
+            return
+        upstreams, desc = built
+        print(f"▶ Проверяю апстрим ({desc})…")
+        try:
+            resp = upstreams[0].query(build_dns_query("example.com"))
+            print(f"  ✔ Апстрим отвечает: example.com → "
+                  f"{', '.join(parse_answers(resp)) or 'ответ получен'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  ✘ Апстрим НЕ отвечает: {e}")
+            print("  Настройки НЕ применены. Проверьте IP, протокол и сертификат.")
+            return
+        key = adapter_key(a)
+        old = get_dns_servers(key)
+        save_backup(key, old)
+        print(f"  Резервная копия DNS: {old or 'авто (DHCP)'}")
+        if proxy:
+            proxy.stop()
+        proxy = LocalDNSProxy(upstreams)
+        try:
+            proxy.start()
+        except OSError as e:
+            print(f"  ✘ Не удалось занять 127.0.0.1:53 — {e}")
+            proxy = None
+            return
+        active = a
+        ok, err = set_dns_servers(key, [LOCAL_DNS])
+        if not ok:
+            print(f"  ✘ Ошибка смены DNS: {err}")
+            proxy.stop()
+            proxy = None
+            return
+        flush_dns_cache()
+        print(f"✔ Шифрованный DNS включён на «{a['name']}». Весь DNS идёт через TLS.")
+
+    def disable():
+        nonlocal proxy, active
+        if proxy:
+            proxy.stop()
+            proxy = None
+            print("  Прокси остановлен.")
+        a = active or (get_adapters() or [None])[0]
+        if a:
+            ok, msg = restore_adapter_dns(adapter_key(a))
+            flush_dns_cache()
+            print(f"  {msg}")
+            cur = get_dns_servers(adapter_key(a))
+            print("  ✔ Откат подтверждён." if cur != [LOCAL_DNS]
+                  else "  ✘ DNS всё ещё 127.0.0.1 — проверьте вручную!")
+        print("✔ Отключено.")
+
+    def test():
+        if proxy:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(8)
+                s.sendto(build_dns_query("example.com"), (LOCAL_DNS, 53))
+                resp, _ = s.recvfrom(4096)
+                s.close()
+                print(f"  ✔ 127.0.0.1:53 → example.com = "
+                      f"{', '.join(parse_answers(resp)) or 'ответ без A-записей'}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  ✘ Прокси не ответил: {e}")
+        else:
+            print("  Прокси не запущен. Сначала включите (пункт 2).")
+
+    try:
+        while True:
+            print("\n  1) Статус   2) Включить   3) Отключить   4) Проверить   5) Выход")
+            cmd = _cli_input("Выбор")
+            if cmd == "1":
+                show_status()
+            elif cmd == "2":
+                enable()
+            elif cmd == "3":
+                disable()
+            elif cmd == "4":
+                test()
+            elif cmd in ("5", "q", "й"):
+                break
+            elif cmd == "":
+                continue
+    except KeyboardInterrupt:
+        print()
+    if proxy:
+        ans = _cli_input("Прокси ещё работает. Отключить и вернуть DNS? (y/n)", "y")
+        if ans.lower() == "y":
+            disable()
+        else:
+            print("⚠ DNS остался на 127.0.0.1. При следующем запуске программа "
+                  "сама вернёт настройки (автооткат).")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--cli" in sys.argv:
+        sys.exit(cli_main())
     _guard = acquire_single_instance()
     if _guard is None:
         _r = tk.Tk()
@@ -1053,4 +1232,11 @@ if __name__ == "__main__":
             "копии и работайте в ней.")
         _r.destroy()
         sys.exit(0)
-    App().mainloop()
+    try:
+        App().mainloop()
+    except tk.TclError as e:
+        print(f"✘ Не удалось открыть окно: {e}", file=sys.stderr)
+        print("Похоже, рутовому GUI не достучаться до дисплея (частая история "
+              "на Wayland).\nЗапустите терминальный режим:  sudo python3 main.py --cli",
+              file=sys.stderr)
+        sys.exit(1)

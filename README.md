@@ -47,6 +47,13 @@ chmod +x securedns.sh
 ./securedns.sh
 ```
 
+**Если окно не открывается** (Wayland-сессия: `couldn't connect to display`) —
+есть полноценный терминальный режим, работает везде:
+
+```
+./securedns.sh --cli
+```
+
 Если вдруг вручную — зависимости и запуск:
 
 ```
