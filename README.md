@@ -1,6 +1,6 @@
 # SecureDNS
 
-Бесплатное приложение для шифрованного DNS на Windows 10 / 11.
+Бесплатное приложение для шифрованного DNS на Windows 10 / 11 и Linux.
 Лицензия MIT — используйте, копируйте, дорабатывайте свободно.
 
 ## Что делает
@@ -8,7 +8,10 @@
 - Поднимает локальный DNS-прокси на `127.0.0.1:53`.
 - Все DNS-запросы системы пересылает на **ваши** серверы по шифрованному
   каналу: **DoT** (DNS-over-TLS, порт 853) или **DoH** (DNS-over-HTTPS, порт 443).
-- Сетевому адаптеру назначает DNS `127.0.0.1`.
+- Системе назначает DNS `127.0.0.1`:
+  - **Windows** — через `Set-DnsClientServerAddress`;
+  - **Linux** — через systemd-resolved (`resolvectl`), NetworkManager (`nmcli`)
+    или прямую правку `/etc/resolv.conf` (что найдётся в системе).
 - Провайдер сети видит только зашифрованный TLS-трафик — содержимое
   DNS-запросов прочитать нельзя.
 
@@ -17,10 +20,13 @@
 
 ## Как пользоваться
 
+### Windows
+
 1. Запустите `SecureDNS.exe` (Windows спросит права администратора — они нужны
    для смены системного DNS).
 2. Впишите IP своих DNS-серверов через запятую.
-3. Выберите протокол: DoT (порт 853) или DoH (укажите URL шаблона).
+3. Выберите протокол: DoT (порт 853) или DoH (укажите URL шаблона; IP сервера
+   в первом поле используется для прямого подключения к DoH без DNS-резолва).
 4. Для своих серверов по IP оставьте галочку «Проверять TLS-сертификат»
    выключенной.
 5. Нажмите **«Включить шифрованный DNS»** — приложение сначала проверит,
@@ -28,12 +34,34 @@
 6. Кнопка **«Проверить»** — тестовый запрос через шифрованный канал.
 7. Кнопка **«Отключить»** — останавливает прокси и возвращает прежние DNS.
 
+### Linux
+
+Зависимости: Python 3.10+ и `python3-tk` (в Debian/Ubuntu: `sudo apt install python3-tk`).
+Смена DNS работает через `resolvectl` (systemd-resolved), `nmcli`
+(NetworkManager) или правку `/etc/resolv.conf` — выбирается автоматически.
+
+```
+sudo -E python3 main.py
+```
+
+Дальше всё то же самое: впишите свои серверы, выберите DoT или DoH, включите.
+
+Сборка portable-бинарника под Linux:
+
+```
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name SecureDNS main.py
+# бинарник в dist/SecureDNS, запуск: sudo ./dist/SecureDNS
+```
+
 ## Откат настроек
 
 Приложение спроектировано так, чтобы после отключения обычный интернет
 работал без проблем:
 
-- Перед сменой DNS сохраняется резервная копия (`%ProgramData%\SecureDNS\backup.json`).
+- Перед сменой DNS сохраняется резервная копия
+  (`%ProgramData%\SecureDNS\backup.json` на Windows, `/etc/securedns/backup.json`
+  на Linux; для режима resolv.conf — копия `/etc/resolv.conf.securedns.bak`).
 - При отключении восстанавливаются сохранённые DNS (или DHCP, если их не было),
   результат проверяется повторным чтением настроек, кэш DNS очищается.
 - Если программу закрыли/убили или выключили компьютер с активной защитой,
@@ -49,8 +77,8 @@
 
 ```
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --uac-admin --name SecureDNS main.py
+pyinstaller --noconfirm --onefile --windowed --uac-admin --name SecureDNS --icon icon.ico main.py
 ```
 
 Готовый exe появится в `dist\SecureDNS.exe`. Зависимостей, кроме стандартной
-библиотеки Python 3.10+, нет. Иконка опциональна (параметр `--icon icon.ico`).
+библиотеки Python 3.10+, нет.

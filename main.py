@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-SecureDNS — бесплатное приложение для шифрованного DNS на Windows 10/11.
+SecureDNS — бесплатное приложение для шифрованного DNS на Windows 10/11 и Linux.
 
 Как работает:
   - Поднимает локальный DNS-прокси на 127.0.0.1:53.
   - Запросы от системы пересылает на ВАШИ серверы по шифрованному каналу:
     DoT (DNS-over-TLS, порт 853) или DoH (DNS-over-HTTPS, порт 443).
-  - Системному адаптеру назначает DNS = 127.0.0.1.
+  - Системе назначает DNS = 127.0.0.1:
+      Windows — через Set-DnsClientServerAddress;
+      Linux — через systemd-resolved (resolvectl), NetworkManager (nmcli)
+              или прямую правку /etc/resolv.conf.
   - Провайдер сети видит только зашифрованный TLS-трафик, запросы не читает.
 
 Работает с ЛЮБЫМИ серверами — просто впишите их IP.
@@ -18,6 +21,7 @@ import http.client
 import json
 import os
 import queue
+import shutil
 import socket
 import ssl
 import struct
@@ -28,10 +32,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.0.1"
-CREATE_NO_WINDOW = 0x08000000
+APP_VERSION = "1.1.0"
+IS_WINDOWS = sys.platform.startswith("win")
+SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
-BACKUP_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "SecureDNS")
+if IS_WINDOWS:
+    BACKUP_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "SecureDNS")
+else:
+    BACKUP_DIR = "/etc/securedns"
 BACKUP_FILE = os.path.join(BACKUP_DIR, "backup.json")
 CONFIG_FILE = os.path.join(BACKUP_DIR, "config.json")
 
@@ -40,66 +48,206 @@ CONFIG_FILE = os.path.join(BACKUP_DIR, "config.json")
 # ---------------------------------------------------------------------------
 
 def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    if IS_WINDOWS:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def admin_hint() -> str:
+    if IS_WINDOWS:
+        return "запустите её «от имени администратора»"
+    return "запустите её через sudo:  sudo -E python3 main.py"
 
 
 def run_ps(command: str, timeout: int = 30):
     full = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + command
     p = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", full],
-        capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW,
+        capture_output=True, timeout=timeout, **SPAWN_KW,
     )
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
+def run_cmd(args, timeout: int = 30):
+    """Запуск внешней команды (Linux)."""
+    p = subprocess.run(args, capture_output=True, timeout=timeout, **SPAWN_KW)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# Сетевой бэкенд: Windows (PowerShell) / Linux (resolvectl, nmcli, resolv.conf)
+# ---------------------------------------------------------------------------
+
+def _linux_dns_tool():
+    for tool in ("resolvectl", "systemd-resolve"):
+        if shutil.which(tool):
+            return tool
+    if shutil.which("nmcli"):
+        return "nmcli"
+    return "resolvconf"
+
+
+def _nmcli_connection(device: str):
+    """Имя активного соединения NetworkManager для устройства."""
+    rc, out, _ = run_cmd(["nmcli", "-t", "-f", "NAME,DEVICE", "con", "show", "--active"])
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.rsplit(":", 1)
+            if len(parts) == 2 and parts[1] == device:
+                return parts[0]
+    return None
+
+
 def get_adapters():
-    rc, out, _ = run_ps(
-        "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
-        "Select-Object ifIndex, Name, InterfaceDescription | ConvertTo-Json -Compress"
-    )
+    """Список активных адаптеров: [{index, name, desc}]."""
+    if IS_WINDOWS:
+        rc, out, _ = run_ps(
+            "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+            "Select-Object ifIndex, Name, InterfaceDescription | ConvertTo-Json -Compress"
+        )
+        if rc != 0 or not out.strip():
+            return []
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        return [{"index": int(a["ifIndex"]), "name": a["Name"],
+                 "desc": a["InterfaceDescription"]} for a in data]
+    # Linux: ip -j link show
+    rc, out, _ = run_cmd(["ip", "-j", "link", "show"])
     if rc != 0 or not out.strip():
         return []
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
         return []
-    if isinstance(data, dict):
-        data = [data]
-    return [{"index": int(a["ifIndex"]), "name": a["Name"],
-             "desc": a["InterfaceDescription"]} for a in data]
+    result = []
+    for a in data:
+        if a.get("ifname") == "lo" or a.get("operstate") != "UP":
+            continue
+        result.append({"index": int(a.get("ifindex", 0)),
+                       "name": a["ifname"],
+                       "desc": a.get("link_type", "link")})
+    return result
 
 
-def get_dns_servers(if_index: int):
-    rc, out, _ = run_ps(
-        f"(Get-DnsClientServerAddress -InterfaceIndex {if_index} -AddressFamily IPv4"
-        f" -ErrorAction SilentlyContinue).ServerAddresses | ConvertTo-Json -Compress"
-    )
-    if not out.strip():
-        return []
+def get_dns_servers(adapter):
+    """Текущие IPv4 DNS адаптера. adapter — index (Windows) или имя (Linux)."""
+    if IS_WINDOWS:
+        rc, out, _ = run_ps(
+            f"(Get-DnsClientServerAddress -InterfaceIndex {adapter} -AddressFamily IPv4"
+            f" -ErrorAction SilentlyContinue).ServerAddresses | ConvertTo-Json -Compress"
+        )
+        if not out.strip():
+            return []
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(data, str):
+            data = [data]
+        return list(data)
+    # Linux
+    tool = _linux_dns_tool()
+    if tool in ("resolvectl", "systemd-resolve"):
+        rc, out, _ = run_cmd([tool, "dns", adapter])
+        if rc == 0 and ":" in out:
+            servers = out.split(":", 1)[1].split()
+            if servers:
+                return servers
+    elif tool == "nmcli":
+        rc, out, _ = run_cmd(["nmcli", "-t", "-f", "IP4.DNS", "dev", "show", adapter])
+        servers = [l.split(":", 1)[1].strip() for l in out.splitlines() if ":" in l]
+        if servers:
+            return servers
+    # fallback: /etc/resolv.conf
     try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
+        with open("/etc/resolv.conf", "r", encoding="utf-8", errors="replace") as f:
+            return [l.split()[1] for l in f
+                    if l.strip().startswith("nameserver") and len(l.split()) > 1]
+    except OSError:
         return []
-    if isinstance(data, str):
-        data = [data]
-    return list(data)
 
 
-def set_dns_servers(if_index: int, servers):
-    rc, _, err = run_ps(
-        "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
-            if_index, ",".join('"%s"' % s for s in servers))
-    )
-    return rc == 0, err.strip()
+def set_dns_servers(adapter, servers):
+    """Назначить DNS адаптеру. Возвращает (ok, ошибка)."""
+    if IS_WINDOWS:
+        rc, _, err = run_ps(
+            "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
+                adapter, ",".join('"%s"' % s for s in servers))
+        )
+        return rc == 0, err.strip()
+    tool = _linux_dns_tool()
+    if tool in ("resolvectl", "systemd-resolve"):
+        rc, _, err = run_cmd([tool, "dns", adapter] + list(servers))
+        if rc == 0:
+            # направляем ВСЕ запросы через этот линк
+            run_cmd([tool, "domain", adapter, "~."])
+        return rc == 0, err.strip()
+    if tool == "nmcli":
+        conn = _nmcli_connection(adapter)
+        if not conn:
+            return False, f"нет активного соединения NM для {adapter}"
+        rc, _, err = run_cmd(["nmcli", "con", "mod", conn,
+                              "ipv4.dns", " ".join(servers),
+                              "ipv4.ignore-auto-dns", "yes"])
+        if rc == 0:
+            run_cmd(["nmcli", "con", "up", conn])
+        return rc == 0, err.strip()
+    # resolvconf: правим /etc/resolv.conf напрямую
+    try:
+        shutil.copy2("/etc/resolv.conf", "/etc/resolv.conf.securedns.bak")
+        with open("/etc/resolv.conf", "w", encoding="utf-8") as f:
+            f.write("# SecureDNS\n" + "".join(f"nameserver {s}\n" for s in servers))
+        return True, ""
+    except OSError as e:
+        return False, str(e)
 
 
-def reset_dns_servers(if_index: int):
-    rc, _, err = run_ps(
-        f"Set-DnsClientServerAddress -InterfaceIndex {if_index} -ResetServerAddresses")
-    return rc == 0, err.strip()
+def reset_dns_servers(adapter):
+    """Вернуть DNS в автоматический режим (DHCP)."""
+    if IS_WINDOWS:
+        rc, _, err = run_ps(
+            f"Set-DnsClientServerAddress -InterfaceIndex {adapter} -ResetServerAddresses")
+        return rc == 0, err.strip()
+    tool = _linux_dns_tool()
+    if tool in ("resolvectl", "systemd-resolve"):
+        rc, _, err = run_cmd([tool, "revert", adapter])
+        return rc == 0, err.strip()
+    if tool == "nmcli":
+        conn = _nmcli_connection(adapter)
+        if not conn:
+            return False, f"нет активного соединения NM для {adapter}"
+        rc, _, err = run_cmd(["nmcli", "con", "mod", conn,
+                              "ipv4.dns", "", "ipv4.ignore-auto-dns", "no"])
+        if rc == 0:
+            run_cmd(["nmcli", "con", "up", conn])
+        return rc == 0, err.strip()
+    try:
+        shutil.copy2("/etc/resolv.conf.securedns.bak", "/etc/resolv.conf")
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def flush_dns_cache():
+    """Очистить системный кэш DNS (best-effort)."""
+    if IS_WINDOWS:
+        flush_dns_cache()
+        return
+    tool = _linux_dns_tool()
+    if tool in ("resolvectl", "systemd-resolve"):
+        run_cmd([tool, "flush-caches"])
+
+
+def adapter_key(a):
+    """Идентификатор адаптера для DNS-операций: ifindex (Windows) или имя (Linux)."""
+    return a["index"] if IS_WINDOWS else a["name"]
 
 
 def save_backup(if_index: int, servers):
@@ -459,14 +607,14 @@ class App(tk.Tk):
         header.pack(fill="x", padx=16, pady=(14, 6))
         ttk.Label(header, text="🛡  SecureDNS", style="Title.TLabel").pack(side="left")
         self.lbl_admin = ttk.Label(header,
-                                   text="админ ✓" if is_admin() else "нет прав админа",
+                                   text="права ✓" if is_admin() else "нет прав",
                                    style="Muted.TLabel",
                                    foreground=GREEN if is_admin() else RED)
         self.lbl_admin.pack(side="right")
 
         if not is_admin():
-            tk.Label(self, text="Нет прав администратора: закройте программу и запустите "
-                                "её «от имени администратора», иначе сменить DNS не выйдет.",
+            tk.Label(self, text="Нет прав администратора: закройте программу и "
+                                + admin_hint() + ", иначе сменить DNS не выйдет.",
                      bg="#4a2c2c", fg="#ffb4b4", font=("Segoe UI", 9), anchor="w",
                      padx=10, pady=6, wraplength=650, justify="left"
                      ).pack(fill="x", padx=16, pady=(0, 8))
@@ -670,7 +818,7 @@ class App(tk.Tk):
         def work():
             self._refresh_adapters()
             a = self._selected_adapter()
-            dns = get_dns_servers(a["index"]) if a else []
+            dns = get_dns_servers(adapter_key(a)) if a else []
             self.q.put(("status", (a, dns)))
             self.q.put(("proxy", None))
         threading.Thread(target=work, daemon=True).start()
@@ -700,7 +848,7 @@ class App(tk.Tk):
     def on_enable(self):
         if not is_admin():
             messagebox.showerror(APP_NAME, "Нужны права администратора.\n"
-                                           "Перезапустите программу «от имени администратора».")
+                                           "Перезапустите программу: " + admin_hint())
             return
         a = self._selected_adapter()
         if not a:
@@ -727,8 +875,8 @@ class App(tk.Tk):
                                    "сертификата. Настройки НЕ применены."))
                 return
             # 1. Бэкап текущих DNS
-            old = get_dns_servers(a["index"])
-            save_backup(a["index"], old)
+            old = get_dns_servers(adapter_key(a))
+            save_backup(adapter_key(a), old)
             self.q.put(("log", f"   Резервная копия DNS: {old or 'авто (DHCP)'}"))
             # 2. Стоп старого прокси, старт нового
             if self.proxy:
@@ -744,15 +892,15 @@ class App(tk.Tk):
             self.q.put(("proxy", None))
             self.q.put(("log", "   ✔ Локальный прокси слушает 127.0.0.1:53"))
             # 3. Назначаем системный DNS
-            ok, err = set_dns_servers(a["index"], [LOCAL_DNS])
+            ok, err = set_dns_servers(adapter_key(a), [LOCAL_DNS])
             if not ok:
                 self.q.put(("log", f"   ✘ Ошибка смены DNS адаптера: {err}"))
                 return
-            run_ps("Clear-DnsClientCache")
+            flush_dns_cache()
             self.q.put(("log", "   DNS адаптера → 127.0.0.1, кэш очищен."))
             self.q.put(("log", "✔ Готово! Весь DNS-трафик шифруется. "
                                "Нажмите «Проверить»."))
-            self.q.put(("status", (a, get_dns_servers(a["index"]))))
+            self.q.put(("status", (a, get_dns_servers(adapter_key(a)))))
         self._run_async(work)
 
     def _restore_adapter_dns(self, if_index: int):
@@ -774,20 +922,19 @@ class App(tk.Tk):
         значит программу закрыли/убили с активной защитой. Возвращаем настройки."""
         def work():
             for a in get_adapters():
-                dns = get_dns_servers(a["index"])
+                dns = get_dns_servers(adapter_key(a))
                 if dns == [LOCAL_DNS]:
                     if not is_admin():
                         self.q.put(("log", f"⚠ Адаптер «{a['name']}» смотрит на 127.0.0.1, "
-                                           f"но прокси не запущен. Для отката нужны "
-                                           f"права администратора — перезапустите программу "
-                                           f"«от имени администратора»."))
+                                           f"но прокси не запущен. Для отката нужны права — "
+                                           f"перезапустите программу: {admin_hint()}"))
                         continue
-                    ok, msg = self._restore_adapter_dns(a["index"])
-                    run_ps("Clear-DnsClientCache")
+                    ok, msg = self._restore_adapter_dns(adapter_key(a))
+                    flush_dns_cache()
                     self.q.put(("log", f"⚠ Обнаружен «зависший» DNS 127.0.0.1 на "
                                        f"«{a['name']}» (программа была закрыта с активной "
                                        f"защитой). Автооткат: {msg}"))
-                    self.q.put(("status", (a, get_dns_servers(a["index"]))))
+                    self.q.put(("status", (a, get_dns_servers(adapter_key(a)))))
         threading.Thread(target=work, daemon=True).start()
 
     def on_disable(self):
@@ -804,16 +951,16 @@ class App(tk.Tk):
                 self.q.put(("proxy", None))
                 self.q.put(("log", "   Локальный прокси остановлен."))
             if a:
-                ok, msg = self._restore_adapter_dns(a["index"])
+                ok, msg = self._restore_adapter_dns(adapter_key(a))
                 self.q.put(("log", f"   {msg}"))
-                run_ps("Clear-DnsClientCache")
+                flush_dns_cache()
                 # Проверяем, что откат реально применился
-                current = get_dns_servers(a["index"])
+                current = get_dns_servers(adapter_key(a))
                 if current == [LOCAL_DNS]:
                     # Последняя линия обороны — принудительный DHCP
-                    ok2, _ = reset_dns_servers(a["index"])
-                    run_ps("Clear-DnsClientCache")
-                    current = get_dns_servers(a["index"])
+                    ok2, _ = reset_dns_servers(adapter_key(a))
+                    flush_dns_cache()
+                    current = get_dns_servers(adapter_key(a))
                     self.q.put(("log", "   ⚠ DNS всё ещё был 127.0.0.1 — принудительно "
                                        f"переведён в DHCP: {'успешно' if ok2 else 'не удалось'}"))
                 if current == [LOCAL_DNS]:
