@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -1058,27 +1058,41 @@ def _cli_input(prompt: str, default: str = "") -> str:
     return val or default
 
 
+def _valid_ip(ip: str) -> bool:
+    p = ip.split(".")
+    return len(p) == 4 and all(x.isdigit() and 0 <= int(x) <= 255 for x in p)
+
+
 def _cli_build_upstreams():
-    """Спрашивает параметры у пользователя, возвращает (upstreams, описание)."""
-    ips_raw = _cli_input("Ваши DNS-серверы (IP через запятую)")
-    ips = [s.strip() for s in ips_raw.split(",") if s.strip()]
-    for ip in ips:
-        parts = ip.split(".")
-        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-            print(f"✘ Некорректный IP: {ip}")
+    """Спрашивает параметры у пользователя, возвращает (upstreams, описание).
+    Опечатки переспрашиваем, пустой ввод — отмена."""
+    while True:
+        raw = _cli_input("Ваши DNS-серверы (IP через запятую, пусто — отмена)")
+        if not raw:
             return None
-    proto = _cli_input("Протокол: dot (порт 853) или doh (порт 443)", "dot").lower()
+        ips = [s.strip() for s in raw.split(",") if s.strip()]
+        bad = [ip for ip in ips if not _valid_ip(ip)]
+        if ips and not bad:
+            break
+        print(f"✘ Некорректные адреса: {', '.join(bad) or raw}. "
+              f"Пример: 9.9.9.9, 149.112.112.112")
+    while True:
+        proto = _cli_input("Протокол: dot (порт 853) или doh (порт 443)", "dot").lower()
+        if proto in ("dot", "doh"):
+            break
+        print("✘ Впишите буквально «dot» или «doh». "
+              "Домен сюда вписывать не надо — он спросится дальше.")
     verify = _cli_input("Проверять TLS-сертификат сервера? (y/n)", "n").lower() == "y"
     if proto == "dot":
-        if not ips:
-            print("✘ Для DoT нужен хотя бы один IP.")
-            return None
         return [DoTUpstream(ip, 853, verify=verify) for ip in ips], \
                f"DoT:853 → {', '.join(ips)}"
-    url = _cli_input("DoH-шаблон (https://.../dns-query)")
-    if not url.startswith("https://"):
-        print("✘ DoH-шаблон должен начинаться с https://")
-        return None
+    while True:
+        url = _cli_input("DoH-шаблон (https://..., пусто — отмена)")
+        if not url:
+            return None
+        if url.startswith("https://"):
+            break
+        print("✘ Шаблон должен начинаться с https://")
     bootstrap = ips[0] if ips else None
     desc = f"DoH → {url}" + (f" (через {bootstrap})" if bootstrap else "")
     try:
@@ -1117,10 +1131,11 @@ def cli_main():
         print("Адаптеры:")
         for i, a in enumerate(ads, 1):
             print(f"  {i}) {a['name']} — {a['desc']}")
-        choice = _cli_input("Номер адаптера", "1")
-        if not choice.isdigit() or not (1 <= int(choice) <= len(ads)):
-            print("✘ Неверный номер.")
-            return
+        while True:
+            choice = _cli_input("Номер адаптера", "1")
+            if choice.isdigit() and 1 <= int(choice) <= len(ads):
+                break
+            print("✘ Нет такого номера — впишите цифру из списка.")
         a = ads[int(choice) - 1]
         built = _cli_build_upstreams()
         if not built:
