@@ -16,12 +16,15 @@ SecureDNS — бесплатное приложение для шифрован�
 Лицензия: MIT. Распространяется бесплатно, "как есть".
 """
 
+import collections
 import concurrent.futures
 import ctypes
+import datetime
 import http.client
 import ipaddress
 import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -34,19 +37,29 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import traceback
 
 APP_NAME = "SecureDNS"
 APP_VERSION = "1.3.2"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
+LOCAL_DNS_V6 = "::1"
+BLOCKED_V6_QUIC_QTYPES = {28, 64, 65}  # AAAA, SVCB, HTTPS
 if IS_WINDOWS:
     BACKUP_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "SecureDNS")
 else:
     BACKUP_DIR = "/etc/securedns"
 BACKUP_FILE = os.path.join(BACKUP_DIR, "backup.json")
 CONFIG_FILE = os.path.join(BACKUP_DIR, "config.json")
+LOG_FILE = os.path.join(BACKUP_DIR, "securedns.log")
+LOG_MAX_BYTES = 512 * 1024
+_LOG_LOCK = threading.Lock()
+_QTYPE_NAMES = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR",
+    15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS",
+}
 
 # ---------------------------------------------------------------------------
 # Вспомогательное
@@ -97,6 +110,63 @@ def run_cmd(args, timeout: int = 30):
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
     except (subprocess.TimeoutExpired, OSError) as e:
         return -1, "", str(e)
+
+
+def write_log_file(msg: str, level: str = "INFO"):
+    """Потокобезопасная запись событий в securedns.log с простой ротацией."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = str(msg).splitlines() or [""]
+    with _LOG_LOCK:
+        try:
+            log_dir = os.path.dirname(LOG_FILE)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+            with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
+                for line in lines:
+                    f.write(f"{ts} [{level}] {line}\n")
+        except OSError:
+            pass
+
+
+def read_log_tail(max_lines: int = 300) -> str:
+    """Возвращает последние max_lines строк из securedns.log (с учётом архива .1)."""
+    cur_lines = []
+    old_lines = []
+    with _LOG_LOCK:
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    cur_lines = f.read().splitlines()
+        except OSError:
+            cur_lines = []
+        if (max_lines <= 0 or len(cur_lines) < max_lines) and os.path.exists(LOG_FILE + ".1"):
+            try:
+                with open(LOG_FILE + ".1", "r", encoding="utf-8", errors="replace") as f:
+                    old_lines = f.read().splitlines()
+            except OSError:
+                old_lines = []
+    if max_lines > 0:
+        if len(cur_lines) >= max_lines:
+            combined = cur_lines[-max_lines:]
+        else:
+            need = max_lines - len(cur_lines)
+            combined = old_lines[-need:] + cur_lines
+    else:
+        combined = old_lines + cur_lines
+    if not combined:
+        return "(файл журнала пуст или отсутствует)"
+    return "\n".join(combined)
+
+
+def log_session_header(mode: str = "GUI"):
+    """Записывает строку старта сессии в securedns.log."""
+    write_log_file(
+        f"=== Запуск {APP_NAME} {APP_VERSION} ({mode}) | OS={platform.platform()} "
+        f"| Python={sys.version.split()[0]} | frozen={is_frozen()} | admin={is_admin()} ===",
+        level="SESSION",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +228,25 @@ def get_adapters():
     return result
 
 
+def _clean_sni_host(raw: str) -> str | None:
+    """Извлекает чистое доменное имя из SNI (отрезает https://, /путь, :порт)."""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if "://" in s or "/" in s:
+        from urllib.parse import urlparse
+        u = urlparse(s if "://" in s else "https://" + s)
+        host = (u.hostname or "").strip().strip(".")
+        return host or None
+    host = s.split(":", 1)[0].strip().strip(".")
+    return host or None
+
+
+def _is_win_default_v6_dns(addr: str) -> bool:
+    s = str(addr or "").strip().lower()
+    return (not s) or s.startswith("fec0:0:0:ffff::")
+
+
 def get_dns_servers(adapter):
     """Текущие IPv4 DNS адаптера. adapter — index (Windows) или имя (Linux)."""
     if IS_WINDOWS:
@@ -196,13 +285,43 @@ def get_dns_servers(adapter):
         return []
 
 
+def get_dns_servers_v6(adapter):
+    """Текущие несистемные IPv6 DNS адаптера (без fec0:0:0:ffff::*)."""
+    if not IS_WINDOWS:
+        return []
+    rc, out, _ = run_ps(
+        f"(Get-DnsClientServerAddress -InterfaceIndex {adapter} -AddressFamily IPv6"
+        f" -ErrorAction SilentlyContinue).ServerAddresses | ConvertTo-Json -Compress"
+    )
+    if rc != 0 or not out.strip():
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, str):
+        data = [data]
+    return [str(s).strip() for s in data if not _is_win_default_v6_dns(s)]
+
+
 def set_dns_servers(adapter, servers):
     """Назначить DNS адаптеру. Возвращает (ok, ошибка)."""
     if IS_WINDOWS:
+        servers_list = [str(s).strip() for s in servers if str(s).strip()]
         rc, _, err = run_ps(
             "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
-                adapter, ",".join('"%s"' % s for s in servers))
+                adapter, ",".join('"%s"' % s for s in servers_list))
         )
+        if rc != 0 and any(":" in s for s in servers_list):
+            v4_only = [s for s in servers_list if ":" not in s]
+            if v4_only:
+                rc4, _, err4 = run_ps(
+                    "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
+                        adapter, ",".join('"%s"' % s for s in v4_only))
+                )
+                if rc4 == 0:
+                    return True, ""
+                return False, (err4 or err).strip()
         return rc == 0, err.strip()
     tool = _linux_dns_tool()
     if tool in ("resolvectl", "systemd-resolve"):
@@ -513,12 +632,27 @@ def do_update(log, download_url=None, expected_size=None, on_before_restart=None
 
 
 def restore_adapter_dns(key):
-    """Вернуть DNS адаптера: из бэкапа, либо в DHCP. Возвращает (ok, описание)."""
-    backup = load_backup(key)
-    if backup and backup != [LOCAL_DNS]:
-        ok, err = set_dns_servers(key, backup)
+    """Вернуть DNS адаптера: из бэкапа (IPv4 + IPv6), либо в DHCP. Возвращает (ok, описание)."""
+    v4, v6 = load_backup_full(key)
+    v4_valid = [s for s in v4 if s != LOCAL_DNS]
+    v6_valid = [s for s in v6 if s != LOCAL_DNS_V6 and not _is_win_default_v6_dns(s)]
+    if IS_WINDOWS:
+        ok_reset, err_reset = reset_dns_servers(key)
+        combined = v4_valid + v6_valid
+        if combined:
+            ok_set, err_set = set_dns_servers(key, combined)
+            if ok_set:
+                return True, f"восстановлены DNS: {', '.join(combined)}"
+            ok2, err2 = reset_dns_servers(key)
+            return ok2, (
+                "бэкап не применился, DNS возвращён в авто (DHCP)"
+                if ok2 else f"{err_set}; и DHCP не сработал: {err2}"
+            )
+        return ok_reset, ("DNS возвращён в авто (DHCP)" if ok_reset else f"ошибка: {err_reset}")
+    if v4_valid:
+        ok, err = set_dns_servers(key, v4_valid)
         if ok:
-            return True, f"восстановлены DNS: {', '.join(backup)}"
+            return True, f"восстановлены DNS: {', '.join(v4_valid)}"
         # бэкап не применился — уходим в DHCP как безопасный вариант
         ok2, err2 = reset_dns_servers(key)
         return ok2, ("бэкап не применился, DNS возвращён в авто (DHCP)"
@@ -527,18 +661,27 @@ def restore_adapter_dns(key):
     return ok, ("DNS возвращён в авто (DHCP)" if ok else f"ошибка: {err}")
 
 
-def startup_rollback(log):
-    """Аварийный откат: если адаптер смотрит на 127.0.0.1, а прокси не запущен —
+def startup_rollback(log, should_abort=None):
+    """Аварийный откат: если адаптер смотрит на 127.0.0.1 или ::1, а прокси не запущен —
     значит программу закрыли/убили с активной защитой. Возвращаем настройки."""
+    if should_abort and should_abort():
+        return
     for a in get_adapters():
-        if get_dns_servers(adapter_key(a)) == [LOCAL_DNS]:
+        if should_abort and should_abort():
+            return
+        k = adapter_key(a)
+        stuck_v4 = get_dns_servers(k) == [LOCAL_DNS]
+        stuck_v6 = get_dns_servers_v6(k) == [LOCAL_DNS_V6]
+        if stuck_v4 or stuck_v6:
+            if should_abort and should_abort():
+                return
             if not is_admin():
-                log(f"⚠ Адаптер «{a['name']}» смотрит на 127.0.0.1, но прокси не "
+                log(f"⚠ Адаптер «{a['name']}» смотрит на 127.0.0.1/::1, но прокси не "
                     f"запущен. Для отката нужны права — перезапустите: {admin_hint()}")
                 continue
-            ok, msg = restore_adapter_dns(adapter_key(a))
+            ok, msg = restore_adapter_dns(k)
             flush_dns_cache()
-            log(f"⚠ Обнаружен «зависший» DNS 127.0.0.1 на «{a['name']}» (программа "
+            log(f"⚠ Обнаружен «зависший» DNS на «{a['name']}» (программа "
                 f"была закрыта с активной защитой). Автооткат: {msg}")
 
 
@@ -575,28 +718,57 @@ def release_single_instance():
             pass
 
 
-def save_backup(if_index: int, servers):
-    if list(servers) == [LOCAL_DNS]:
+def save_backup(if_index: int, servers, servers_v6=None):
+    v4_clean = [str(s).strip() for s in (servers or []) if str(s).strip()]
+    v6_clean = None
+    if servers_v6 is not None:
+        v6_clean = [str(s).strip() for s in servers_v6 if not _is_win_default_v6_dns(s)]
+
+    save_v4 = v4_clean != [LOCAL_DNS]
+    save_v6 = (v6_clean is not None) and (v6_clean != [LOCAL_DNS_V6])
+    if not save_v4 and not save_v6:
         return
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         data = {}
         if os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        data[str(if_index)] = {"servers": servers}
+            try:
+                with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        entry = data.get(str(if_index))
+        if not isinstance(entry, dict):
+            entry = {}
+        if save_v4:
+            entry["servers"] = v4_clean
+        if save_v6:
+            entry["servers_v6"] = v6_clean
+        data[str(if_index)] = entry
         with open(BACKUP_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
 
-def load_backup(if_index: int):
+def load_backup_full(if_index: int) -> tuple[list, list]:
     try:
         with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get(str(if_index), {}).get("servers", [])
+            entry = json.load(f).get(str(if_index), {})
+        if not isinstance(entry, dict):
+            return [], []
+        v4 = [str(s).strip() for s in entry.get("servers", []) if str(s).strip()]
+        v6 = [str(s).strip() for s in entry.get("servers_v6", []) if not _is_win_default_v6_dns(s)]
+        return v4, v6
     except (OSError, json.JSONDecodeError):
-        return []
+        return [], []
+
+
+def load_backup(if_index: int):
+    v4, _ = load_backup_full(if_index)
+    return v4
 
 
 # ---------------------------------------------------------------------------
@@ -772,26 +944,37 @@ class DoHUpstream:
 
 
 # ---------------------------------------------------------------------------
-# Локальный DNS-прокси (UDP + TCP на 127.0.0.1:53)
+# Локальный DNS-прокси (UDP + TCP на 127.0.0.1:53 и ::1:53)
 # ---------------------------------------------------------------------------
 
 class LocalDNSProxy:
-    def __init__(self, upstreams, on_log=None, bind_port: int = 53, cooldown_sec: float = 30.0):
+    def __init__(self, upstreams, on_log=None, bind_port: int = 53,
+                 cooldown_sec: float = 30.0, block_v6_quic: bool = False,
+                 bind_ipv6: bool = True):
         self.upstreams = list(upstreams)    # список DoTUpstream/DoHUpstream
         self.on_log = on_log or (lambda m: None)
         self.bind_port = bind_port
         self._cooldown_sec = cooldown_sec
+        self.block_v6_quic = bool(block_v6_quic)
+        self._bind_ipv6 = bool(bind_ipv6)
+        self.ipv6_bound = False
         self._cooldown_until = [0.0] * len(self.upstreams)
         self._cooldown_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._stats = {"total": 0, "ok": 0, "blocked_v6_quic": 0, "err": 0}
+        self._recent = collections.deque(maxlen=40)
         self._stop = threading.Event()
         self._threads = []
         self._pool = None
         self._udp = None
         self._tcp = None
+        self._udp6 = None
+        self._tcp6 = None
 
     def start(self):
         self._stop.clear()
         self._threads = []
+        self.ipv6_bound = False
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tcp = None
         try:
@@ -821,15 +1004,145 @@ class LocalDNSProxy:
 
         self._udp = udp
         self._tcp = tcp
+
+        if self._bind_ipv6 and socket.has_ipv6:
+            udp6 = None
+            tcp6 = None
+            try:
+                udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                if hasattr(socket, "IPV6_V6ONLY"):
+                    udp6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                if IS_WINDOWS and hasattr(socket, "SIO_UDP_CONNRESET"):
+                    try:
+                        udp6.ioctl(socket.SIO_UDP_CONNRESET, False)
+                    except OSError:
+                        pass
+                udp6.bind((LOCAL_DNS_V6, self.bind_port))
+                udp6.settimeout(1.0)
+
+                tcp6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                if hasattr(socket, "IPV6_V6ONLY"):
+                    tcp6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                tcp6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                tcp6.bind((LOCAL_DNS_V6, self.bind_port))
+                tcp6.listen(32)
+                tcp6.settimeout(1.0)
+
+                self._udp6 = udp6
+                self._tcp6 = tcp6
+                self.ipv6_bound = True
+            except OSError:
+                for s in (udp6, tcp6):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                self._udp6 = None
+                self._tcp6 = None
+                self.ipv6_bound = False
+
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=32, thread_name_prefix="DNSWorker"
         )
-        for target in (self._udp_loop, self._tcp_loop):
-            t = threading.Thread(target=target, daemon=True)
+        loops = [(self._udp_loop, self._udp), (self._tcp_loop, self._tcp)]
+        if self.ipv6_bound:
+            loops.extend([(self._udp_loop, self._udp6), (self._tcp_loop, self._tcp6)])
+        for target, sock in loops:
+            t = threading.Thread(target=target, args=(sock,), daemon=True)
             t.start()
             self._threads.append(t)
 
+    @staticmethod
+    def _parse_question(packet: bytes) -> tuple[str, int | None]:
+        try:
+            if len(packet) < 12:
+                return "<unknown>", None
+            qdcount = struct.unpack("!H", packet[4:6])[0]
+            if qdcount < 1:
+                return "<unknown>", None
+            pos = 12
+            labels = []
+            steps = 0
+            n = len(packet)
+            while pos < n and steps < 128:
+                length = packet[pos]
+                if length == 0:
+                    pos += 1
+                    break
+                if (length & 0xC0) == 0xC0:
+                    if pos + 2 > n:
+                        return "<unknown>", None
+                    pos += 2
+                    break
+                if (length & 0xC0) != 0:
+                    return "<unknown>", None
+                pos += 1
+                if pos + length > n:
+                    return "<unknown>", None
+                labels.append(packet[pos:pos + length].decode("ascii", "replace"))
+                pos += length
+                steps += 1
+            else:
+                return "<unknown>", None
+            if pos + 4 > n:
+                return ".".join(labels) or "<root>", None
+            qtype = struct.unpack("!H", packet[pos:pos + 2])[0]
+            return ".".join(labels) or "<root>", qtype
+        except Exception:  # noqa: BLE001
+            return "<unknown>", None
+
+    @staticmethod
+    def _parse_first_qtype(packet: bytes) -> int | None:
+        _, qtype = LocalDNSProxy._parse_question(packet)
+        return qtype
+
+    def _record_query(self, qname: str, qtype: int | None, outcome: str, stat_key: str):
+        qtype_str = _QTYPE_NAMES.get(qtype, str(qtype) if qtype is not None else "?")
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        with self._stats_lock:
+            self._stats["total"] += 1
+            self._stats[stat_key] = self._stats.get(stat_key, 0) + 1
+            self._recent.append((ts, qtype_str, qname, outcome))
+
+    def get_stats(self) -> dict:
+        with self._stats_lock:
+            return {
+                "bind_port": self.bind_port,
+                "ipv6_bound": self.ipv6_bound,
+                "block_v6_quic": self.block_v6_quic,
+                "stats": dict(self._stats),
+                "recent": list(self._recent),
+            }
+
+    @staticmethod
+    def _build_nodata(packet: bytes) -> bytes | None:
+        if len(packet) < 12:
+            return None
+        tid = packet[:2]
+        flags = struct.unpack("!H", packet[2:4])[0]
+        resp_flags = 0x8000 | (flags & 0x0100)  # QR=1, keep RD, RCODE=0 (NOERROR)
+        qdcount = struct.unpack("!H", packet[4:6])[0]
+        pos = 12
+        try:
+            for _ in range(qdcount):
+                pos = _skip_name(packet, pos) + 4
+        except Exception:  # noqa: BLE001
+            return None
+        if pos > len(packet):
+            return None
+        question = packet[12:pos] if qdcount > 0 else b""
+        header = tid + struct.pack("!HHHHH", resp_flags, qdcount if question else 0, 0, 0, 0)
+        return header + question
+
     def _forward(self, packet: bytes) -> bytes:
+        qname, qtype = self._parse_question(packet)
+        if self.block_v6_quic and qtype in BLOCKED_V6_QUIC_QTYPES:
+            nodata = self._build_nodata(packet)
+            if nodata is not None:
+                self._record_query(qname, qtype, "NODATA (blocked IPv6/QUIC)", "blocked_v6_quic")
+                return nodata
+
         with self._cooldown_lock:
             now = time.monotonic()
             ready = [i for i, until in enumerate(self._cooldown_until) if until <= now]
@@ -846,6 +1159,9 @@ class LocalDNSProxy:
                 resp = up.query(packet)
                 with self._cooldown_lock:
                     self._cooldown_until[idx] = 0.0
+                ans = parse_answers(resp)
+                summary = ", ".join(ans[:4]) if ans else f"OK ({len(resp)} B)"
+                self._record_query(qname, qtype, summary, "ok")
                 return resp
             except Exception as e:  # noqa: BLE001
                 with self._cooldown_lock:
@@ -853,6 +1169,7 @@ class LocalDNSProxy:
                 last = e
                 if not self._stop.is_set():
                     self.on_log(f"   ✘ {e}")
+        self._record_query(qname, qtype, f"ERR: {last}", "err")
         raise IOError(f"все апстримы недоступны ({last})")
 
     @staticmethod
@@ -874,9 +1191,8 @@ class LocalDNSProxy:
         header = tid + struct.pack("!HHHHH", resp_flags, qdcount if question else 0, 0, 0, 0)
         return header + question
 
-    def _udp_loop(self):
+    def _udp_loop(self, sock):
         while not self._stop.is_set():
-            sock = self._udp
             if sock is None:
                 break
             try:
@@ -890,11 +1206,11 @@ class LocalDNSProxy:
             pool = self._pool
             if pool is not None:
                 try:
-                    pool.submit(self._handle_udp, data, addr)
+                    pool.submit(self._handle_udp, sock, data, addr)
                 except RuntimeError:
                     break
 
-    def _handle_udp(self, data, addr):
+    def _handle_udp(self, sock, data, addr):
         if self._stop.is_set():
             return
         try:
@@ -905,16 +1221,14 @@ class LocalDNSProxy:
             resp = self._build_servfail(data)
             if not resp:
                 return
-        sock = self._udp
-        if sock is not None and not self._stop.is_set():
+        if sock is not None and not self._stop.is_set() and sock.fileno() != -1:
             try:
                 sock.sendto(resp, addr)
             except OSError:
                 pass
 
-    def _tcp_loop(self):
+    def _tcp_loop(self, sock):
         while not self._stop.is_set():
-            sock = self._tcp
             if sock is None:
                 break
             try:
@@ -965,7 +1279,7 @@ class LocalDNSProxy:
 
     def stop(self):
         self._stop.set()
-        for s in (self._udp, self._tcp):
+        for s in (self._udp, self._tcp, self._udp6, self._tcp6):
             if s is not None:
                 try:
                     s.close()
@@ -973,6 +1287,9 @@ class LocalDNSProxy:
                     pass
         self._udp = None
         self._tcp = None
+        self._udp6 = None
+        self._tcp6 = None
+        self.ipv6_bound = False
         pool = self._pool
         self._pool = None
         if pool is not None:
@@ -1040,6 +1357,166 @@ def parse_answers(packet: bytes):
     return answers
 
 
+def default_log_export_dir() -> str:
+    """Папка по умолчанию для сохранения диагностического .txt отчёта."""
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    return desktop if os.path.isdir(desktop) else os.path.expanduser("~")
+
+
+def _read_text_safe(path: str) -> str:
+    try:
+        if not os.path.exists(path):
+            return "(файл отсутствует)"
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read().strip()
+        return txt if txt else "(файл пуст)"
+    except OSError as e:
+        return f"(не удалось прочитать: {e})"
+
+
+def collect_diagnostics(app_state: dict | None = None, ui_log_text: str = "") -> str:
+    """Собирает полный текстовый отчёт для разбора проблем без скриншотов."""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"================ {APP_NAME} {APP_VERSION} DIAGNOSTIC REPORT ================",
+        f"Generated: {now}",
+        f"OS: {platform.platform()} ({platform.machine()})",
+        f"Python: {sys.version.split()[0]} | Executable: {sys.executable}",
+        f"Frozen: {is_frozen()} | Admin: {is_admin()}",
+        f"BackupDir: {BACKUP_DIR}",
+        f"ConfigFile: {CONFIG_FILE}",
+        f"BackupFile: {BACKUP_FILE}",
+        f"LogFile: {LOG_FILE}",
+        "",
+        "--- APP STATE ---",
+    ]
+    if app_state:
+        sni_raw = app_state.get("sni", "")
+        sni_clean = _clean_sni_host(sni_raw) if sni_raw else None
+        proxy_stats = app_state.get("proxy_stats")
+        proxy_running = bool(app_state.get("proxy_running") or proxy_stats is not None)
+        lines.extend([
+            f"SelectedAdapter: {app_state.get('adapter') or 'не выбран'}",
+            f"IPs: {app_state.get('ips', '')!r}",
+            f"Proto: {app_state.get('proto', '')!r}",
+            f"SNI (raw): {sni_raw!r} -> clean: {sni_clean!r}",
+            f"DoH URL: {app_state.get('doh_url', '')!r}",
+            f"Verify TLS: {app_state.get('verify')}",
+            f"Block IPv6/QUIC: {app_state.get('block_v6_quic')}",
+            f"Proxy Running: {proxy_running}",
+        ])
+    else:
+        lines.append("(нет активного снимка UI)")
+
+    lines.extend([
+        "",
+        f"--- SAVED CONFIG ({CONFIG_FILE}) ---",
+        _read_text_safe(CONFIG_FILE),
+        "",
+        f"--- SAVED BACKUP ({BACKUP_FILE}) ---",
+        _read_text_safe(BACKUP_FILE),
+        "",
+        "--- PROXY TELEMETRY ---",
+    ])
+    proxy_stats = (app_state or {}).get("proxy_stats")
+    if proxy_stats:
+        st = proxy_stats.get("stats") or {}
+        lines.extend([
+            f"BindPort: {proxy_stats.get('bind_port')} | IPv6Bound: {proxy_stats.get('ipv6_bound')} "
+            f"| BlockV6QUIC: {proxy_stats.get('block_v6_quic')}",
+            f"Counters: total={st.get('total', 0)}, ok={st.get('ok', 0)}, "
+            f"blocked_v6_quic={st.get('blocked_v6_quic', 0)}, err={st.get('err', 0)}",
+            "RecentQueries (up to 40):",
+        ])
+        recent = proxy_stats.get("recent") or []
+        if recent:
+            for ts, qt, qn, out in recent:
+                lines.append(f"  {ts}  {qt:<6} {qn} -> {out}")
+        else:
+            lines.append("  (запросов пока не было)")
+    else:
+        lines.append("(прокси сейчас остановлен)")
+
+    lines.extend(["", "--- NETWORK ADAPTERS & DNS ---"])
+    try:
+        adapters = get_adapters()
+    except Exception as e:  # noqa: BLE001
+        adapters = []
+        lines.append(f"get_adapters error: {e}")
+    if not adapters:
+        lines.append("(активных адаптеров не найдено)")
+    for a in adapters:
+        try:
+            k = adapter_key(a)
+            v4 = get_dns_servers(k)
+            v6 = get_dns_servers_v6(k)
+            lines.append(
+                f"[{a.get('index')}] {a.get('name')} ({a.get('desc')}) | "
+                f"IPv4={v4 or ['DHCP']} | IPv6={v6 or ['DHCP/default']}"
+            )
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"[{a.get('index')}] {a.get('name')}: error reading DNS: {e}")
+
+    if IS_WINDOWS:
+        ps_checks = [
+            (
+                "WINDOWS Get-DnsClientServerAddress",
+                "Get-DnsClientServerAddress | Where-Object { $_.ServerAddresses.Count -gt 0 } "
+                "| Format-Table InterfaceIndex, InterfaceAlias, AddressFamily, ServerAddresses -AutoSize "
+                "| Out-String -Width 200",
+            ),
+            (
+                "WINDOWS Port 53 UDP Listeners",
+                "Get-NetUDPEndpoint -LocalPort 53 -ErrorAction SilentlyContinue "
+                "| Select-Object LocalAddress, LocalPort, OwningProcess, "
+                "@{n='Process';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} "
+                "| Format-Table -AutoSize | Out-String -Width 160",
+            ),
+            (
+                "WINDOWS Get-DnsClientDohServerAddress",
+                "Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue "
+                "| Format-Table -AutoSize | Out-String -Width 160",
+            ),
+        ]
+        for title, cmd in ps_checks:
+            lines.extend(["", f"--- {title} ---"])
+            try:
+                rc, out, err = run_ps(cmd, timeout=8)
+                body = out.strip() or err.strip() or f"(пусто, rc={rc})"
+                lines.append(body)
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"(ошибка выполнения: {e})")
+    else:
+        lines.extend(["", "--- LINUX resolvectl status (first 80 lines) ---"])
+        try:
+            rc, out, err = run_cmd(["resolvectl", "status"], timeout=8)
+            if rc == 0 and out.strip():
+                lines.extend(out.splitlines()[:80])
+            else:
+                lines.append(err.strip() or f"(resolvectl rc={rc})")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"(ошибка resolvectl: {e})")
+        lines.extend(["", "--- LINUX /etc/resolv.conf ---", _read_text_safe("/etc/resolv.conf")])
+
+    if ui_log_text and ui_log_text.strip():
+        lines.extend(["", "--- CURRENT GUI LOG ---", ui_log_text.strip()])
+
+    lines.extend(["", f"--- PERSISTENT LOG TAIL ({LOG_FILE}, last 300 lines) ---", read_log_tail(300)])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_diagnostics_report(path: str, app_state: dict | None = None, ui_log_text: str = "") -> str:
+    """Формирует и сохраняет диагностический .txt отчёт в указанный файл."""
+    report = collect_diagnostics(app_state=app_state, ui_log_text=ui_log_text)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(report)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -1052,8 +1529,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION} — шифрованный DNS (DoT/DoH)")
-        self.geometry("700x700")
-        self.minsize(660, 660)
+        self.geometry("700x725")
+        self.minsize(660, 680)
         self.configure(bg=BG)
         if IS_WINDOWS:
             try:
@@ -1069,12 +1546,13 @@ class App(tk.Tk):
         self._busy = False
         self._update_info = None
         self.btn_update = None
+        self.btn_save_log = None
         self.q = queue.Queue()
+        log_session_header("GUI")
         self._build_ui()
         self._load_config()
         self._poll_queue()
-        self.after(50, self.refresh_status)
-        self.after(600, self._startup_rollback)
+        self.after(50, self._startup_init)
         self.after(2000, self._check_update_bg)
 
     # ---------- UI ----------
@@ -1090,7 +1568,23 @@ class App(tk.Tk):
                         font=("Segoe UI", 9))
         style.configure("Title.TLabel", background=BG, foreground=FG,
                         font=("Segoe UI Semibold", 15))
-        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG)
+        style.configure(
+            "TCombobox",
+            fieldbackground=PANEL,
+            background=PANEL,
+            foreground=FG,
+            selectbackground=PANEL,
+            selectforeground=FG,
+            arrowcolor=FG,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", PANEL), ("disabled", BG), ("active", PANEL)],
+            foreground=[("readonly", FG), ("disabled", MUTED)],
+            background=[("readonly", PANEL), ("active", "#333947")],
+            selectbackground=[("readonly", PANEL)],
+            selectforeground=[("readonly", FG)],
+        )
         style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10))
         style.map("TRadiobutton", background=[("active", BG)])
         style.configure("TCheckbutton", background=BG, foreground=FG, font=("Segoe UI", 9))
@@ -1101,10 +1595,16 @@ class App(tk.Tk):
         style.configure("TButton", background=PANEL, foreground=FG,
                         font=("Segoe UI", 10), padding=(12, 6), borderwidth=0)
         style.map("TButton", background=[("active", "#333947")])
+        style.configure("Small.TButton", background=PANEL, foreground=FG,
+                        font=("Segoe UI", 9), padding=(10, 4), borderwidth=0)
+        style.map("Small.TButton", background=[("active", "#333947")])
         style.configure("TEntry", fieldbackground=PANEL, foreground=FG,
-                        insertcolor=FG, borderwidth=1)
+                        insertcolor=FG, selectbackground=ACCENT,
+                        selectforeground="white", borderwidth=1)
         self.option_add("*TCombobox*Listbox.background", PANEL)
         self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", "white")
 
         header = ttk.Frame(self)
         header.pack(fill="x", padx=16, pady=(14, 6))
@@ -1183,6 +1683,11 @@ class App(tk.Tk):
                                   "(выключите для своих серверов по IP)",
                         variable=self.var_verify).pack(anchor="w", pady=(6, 0))
 
+        # Блокировка IPv6 и QUIC (утечки мимо SmartDNS)
+        self.var_block_v6_quic = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Блокировать IPv6 и QUIC (рекомендуется для SmartDNS / ИИ)",
+                        variable=self.var_block_v6_quic).pack(anchor="w", pady=(2, 0))
+
         # Кнопки
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=16, pady=14)
@@ -1197,6 +1702,14 @@ class App(tk.Tk):
         self.btn_refresh.pack(side="right")
 
         # Лог
+        log_bar = ttk.Frame(self)
+        log_bar.pack(fill="x", padx=16, pady=(0, 4))
+        ttk.Label(log_bar, text="Журнал событий:", style="Muted.TLabel").pack(side="left")
+        self.btn_save_log = ttk.Button(
+            log_bar, text="Сохранить лог (.txt)", style="Small.TButton", command=self.on_save_log
+        )
+        self.btn_save_log.pack(side="right")
+
         self.txt_log = tk.Text(self, bg="#12141a", fg="#b8c0cc", insertbackground=FG,
                                font=("Consolas", 9), wrap="word", relief="flat",
                                state="disabled")
@@ -1211,6 +1724,7 @@ class App(tk.Tk):
         self.txt_log.insert("end", msg.rstrip() + "\n")
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
+        write_log_file(msg)
 
     def _thread_log(self, msg):
         self.q.put(("log", msg))
@@ -1218,7 +1732,8 @@ class App(tk.Tk):
     def _set_busy(self, busy: bool):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for btn in (self.btn_on, self.btn_off, self.btn_test, self.btn_refresh, self.btn_update):
+        for btn in (self.btn_on, self.btn_off, self.btn_test,
+                    self.btn_refresh, self.btn_save_log, self.btn_update):
             if btn is not None:
                 try:
                     btn.configure(state=state)
@@ -1233,6 +1748,7 @@ class App(tk.Tk):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
+                write_log_file(traceback.format_exc(), level="ERROR")
                 self.q.put(("log", f"Неожиданная ошибка: {e}"))
             finally:
                 self.q.put(("done", None))
@@ -1254,6 +1770,8 @@ class App(tk.Tk):
                     self._apply_proxy_state(payload)
                 elif kind == "update":
                     self._show_update_button(payload)
+                elif kind == "log_saved":
+                    self._on_log_saved(payload)
                 elif kind == "quit":
                     if self.proxy:
                         self.proxy.stop()
@@ -1329,7 +1847,7 @@ class App(tk.Tk):
                     self.q.put(("proxy", None))
                 if self.active_adapter:
                     key = adapter_key(self.active_adapter)
-                    if get_dns_servers(key) == [LOCAL_DNS]:
+                    if get_dns_servers(key) == [LOCAL_DNS] or get_dns_servers_v6(key) == [LOCAL_DNS_V6]:
                         restore_adapter_dns(key)
                         flush_dns_cache()
                     self.active_adapter = None
@@ -1369,7 +1887,7 @@ class App(tk.Tk):
             if not ips:
                 messagebox.showerror(APP_NAME, "Для DoT впишите хотя бы один IP сервера.")
                 return None
-            sni = self.ent_sni.get().strip() or None
+            sni = _clean_sni_host(self.ent_sni.get())
             if verify and not sni:
                 if not messagebox.askyesno(
                         APP_NAME,
@@ -1398,6 +1916,7 @@ class App(tk.Tk):
                 self.ent_ips.insert(0, ips)
             self.var_proto.set(cfg.get("proto", "dot"))
             self.var_verify.set(bool(cfg.get("verify", False)))
+            self.var_block_v6_quic.set(bool(cfg.get("block_v6_quic", True)))
             if cfg.get("sni"):
                 self.ent_sni.delete(0, "end")
                 self.ent_sni.insert(0, cfg["sni"])
@@ -1416,6 +1935,7 @@ class App(tk.Tk):
                     "ips": self.ent_ips.get().strip(),
                     "proto": self.var_proto.get(),
                     "verify": self.var_verify.get(),
+                    "block_v6_quic": self.var_block_v6_quic.get(),
                     "sni": self.ent_sni.get().strip(),
                     "doh_url": self.ent_doh.get().strip(),
                 }, f, ensure_ascii=False, indent=2)
@@ -1423,7 +1943,7 @@ class App(tk.Tk):
             pass
 
     # ---------- статус ----------
-    def _apply_adapters_and_status(self, adapters, sel, dns):
+    def _apply_adapters_and_status(self, adapters, sel, dns, dns_v6=None):
         self.adapters = adapters
         names = [f"{a['name']}  —  {a['desc']}" for a in adapters]
         self.cmb_adapter["values"] = names
@@ -1433,7 +1953,7 @@ class App(tk.Tk):
             self.cmb_adapter.current(0)
         else:
             self.cmb_adapter.set("")
-        self._apply_status(sel, dns)
+        self._apply_status(sel, dns, dns_v6)
 
     def refresh_status(self):
         prev = self._selected_adapter()
@@ -1444,27 +1964,32 @@ class App(tk.Tk):
             if sel is None and adapters:
                 sel = adapters[0]
             dns = get_dns_servers(adapter_key(sel)) if sel else []
-            self.q.put(("adapters_status", (adapters, sel, dns)))
+            dns_v6 = get_dns_servers_v6(adapter_key(sel)) if sel else []
+            self.q.put(("adapters_status", (adapters, sel, dns, dns_v6)))
             self.q.put(("proxy", None))
         threading.Thread(target=work, daemon=True).start()
 
-    def _apply_status(self, adapter, dns):
+    def _apply_status(self, adapter, dns, dns_v6=None):
         if adapter:
             self.lbl_adapter.config(
                 text=f"Адаптер: {adapter['name']} — {adapter['desc']}")
         else:
             self.lbl_adapter.config(text="Адаптер: не выбран")
         if dns == [LOCAL_DNS]:
-            self.lbl_dns.config(text="DNS адаптера: 127.0.0.1 (через SecureDNS ✔)",
+            v6_mark = " + ::1" if dns_v6 == [LOCAL_DNS_V6] else ""
+            self.lbl_dns.config(text=f"DNS адаптера: 127.0.0.1{v6_mark} (через SecureDNS ✔)",
                                 foreground=GREEN)
         else:
+            all_dns = list(dns or []) + [s for s in (dns_v6 or []) if s not in (dns or [])]
             self.lbl_dns.config(
-                text="DNS адаптера: " + (", ".join(dns) if dns else "автоматически (DHCP)"),
+                text="DNS адаптера: " + (", ".join(all_dns) if all_dns else "автоматически (DHCP)"),
                 foreground=MUTED)
 
     def _apply_proxy_state(self, _):
         if self.proxy:
-            self.lbl_proxy.config(text="Прокси: работает на 127.0.0.1:53 ✔",
+            v6_txt = " + ::1:53" if self.proxy.ipv6_bound else ""
+            blk_txt = " [блок IPv6/QUIC]" if self.proxy.block_v6_quic else ""
+            self.lbl_proxy.config(text=f"Прокси: работает на 127.0.0.1:53{v6_txt}{blk_txt} ✔",
                                   foreground=GREEN)
         else:
             self.lbl_proxy.config(text="Прокси: остановлен", foreground=MUTED)
@@ -1483,6 +2008,7 @@ class App(tk.Tk):
         if not built:
             return
         upstreams, desc = built
+        block_v6_quic = self.var_block_v6_quic.get()
         self._save_config()
         prev_active = self.active_adapter
 
@@ -1512,23 +2038,27 @@ class App(tk.Tk):
             # 1. Если защита была включена на другом адаптере — откатим его DNS
             if prev_active and adapter_key(prev_active) != adapter_key(a):
                 prev_k = adapter_key(prev_active)
-                if get_dns_servers(prev_k) == [LOCAL_DNS]:
+                if get_dns_servers(prev_k) == [LOCAL_DNS] or get_dns_servers_v6(prev_k) == [LOCAL_DNS_V6]:
                     _, prev_msg = restore_adapter_dns(prev_k)
                     self.q.put(("log", f"   Предыдущий адаптер «{prev_active['name']}»: {prev_msg}"))
 
-            # 2. Бэкап текущих DNS
-            old = get_dns_servers(adapter_key(a))
-            if old == [LOCAL_DNS]:
-                self.q.put(("log", "   На адаптере уже 127.0.0.1 — прежний бэкап DNS сохранён."))
+            # 2. Бэкап текущих DNS (IPv4 и IPv6)
+            k = adapter_key(a)
+            old = get_dns_servers(k)
+            old_v6 = get_dns_servers_v6(k)
+            if old == [LOCAL_DNS] or old_v6 == [LOCAL_DNS_V6]:
+                save_backup(k, old, old_v6)
+                self.q.put(("log", "   На адаптере уже адрес SecureDNS — прежний бэкап сохранён."))
             else:
-                save_backup(adapter_key(a), old)
-                self.q.put(("log", f"   Резервная копия DNS: {old or 'авто (DHCP)'}"))
+                save_backup(k, old, old_v6)
+                old_all = list(old or []) + list(old_v6 or [])
+                self.q.put(("log", f"   Резервная копия DNS: {old_all or 'авто (DHCP)'}"))
 
             # 3. Стоп старого прокси, старт нового
             if self.proxy:
                 self.proxy.stop()
                 self.proxy = None
-            proxy = LocalDNSProxy(upstreams, on_log=self._thread_log)
+            proxy = LocalDNSProxy(upstreams, on_log=self._thread_log, block_v6_quic=block_v6_quic)
             try:
                 proxy.start()
             except OSError as e:
@@ -1538,10 +2068,13 @@ class App(tk.Tk):
             self.proxy = proxy
             self.active_adapter = a
             self.q.put(("proxy", None))
-            self.q.put(("log", "   ✔ Локальный прокси слушает 127.0.0.1:53"))
+            v6_msg = " + ::1:53" if proxy.ipv6_bound else ""
+            blk_msg = ", блок IPv6/QUIC: ВКЛ" if block_v6_quic else ""
+            self.q.put(("log", f"   ✔ Локальный прокси слушает 127.0.0.1:53{v6_msg}{blk_msg}"))
 
             # 4. Назначаем системный DNS
-            ok, err = set_dns_servers(adapter_key(a), [LOCAL_DNS])
+            target_dns = [LOCAL_DNS, LOCAL_DNS_V6] if (IS_WINDOWS and block_v6_quic and proxy.ipv6_bound) else [LOCAL_DNS]
+            ok, err = set_dns_servers(k, target_dns)
             if not ok:
                 self.q.put(("log", f"   ✘ Ошибка смены DNS адаптера: {err}"))
                 proxy.stop()
@@ -1550,25 +2083,30 @@ class App(tk.Tk):
                 self.q.put(("proxy", None))
                 return
             flush_dns_cache()
-            self.q.put(("log", "   DNS адаптера → 127.0.0.1, кэш очищен."))
+            cur_v4 = get_dns_servers(k)
+            cur_v6 = get_dns_servers_v6(k)
+            assigned = " + ".join(cur_v4 + ([LOCAL_DNS_V6] if cur_v6 == [LOCAL_DNS_V6] else [])) or LOCAL_DNS
+            self.q.put(("log", f"   DNS адаптера → {assigned}, кэш очищен."))
             self.q.put(("log", "✔ Готово! Весь DNS-трафик шифруется. "
                                "Нажмите «Проверить»."))
-            self.q.put(("status", (a, get_dns_servers(adapter_key(a)))))
+            self.q.put(("status", (a, cur_v4, cur_v6)))
         self._run_async(work)
 
     def _restore_adapter_dns(self, if_index: int):
         return restore_adapter_dns(if_index)
 
-    def _startup_rollback(self):
+    def _startup_init(self):
         def work():
-            changed = False
-            def _rb_log(msg: str):
-                nonlocal changed
-                changed = True
-                self._thread_log(msg)
-            startup_rollback(_rb_log)
-            if changed:
-                self.q.put(("refresh_req", None))
+            startup_rollback(
+                self._thread_log,
+                should_abort=lambda: self.proxy is not None or self._busy,
+            )
+            adapters = get_adapters()
+            sel = adapters[0] if adapters else None
+            dns = get_dns_servers(adapter_key(sel)) if sel else []
+            dns_v6 = get_dns_servers_v6(adapter_key(sel)) if sel else []
+            self.q.put(("adapters_status", (adapters, sel, dns, dns_v6)))
+            self.q.put(("proxy", None))
         threading.Thread(target=work, daemon=True).start()
 
     def on_disable(self, quit_after: bool = False):
@@ -1586,26 +2124,30 @@ class App(tk.Tk):
                 self.q.put(("log", "   Локальный прокси остановлен."))
             self.active_adapter = None
             if a:
-                ok, msg = self._restore_adapter_dns(adapter_key(a))
+                k = adapter_key(a)
+                ok, msg = self._restore_adapter_dns(k)
                 self.q.put(("log", f"   {msg}"))
                 flush_dns_cache()
                 # Проверяем, что откат реально применился
-                current = get_dns_servers(adapter_key(a))
-                if current == [LOCAL_DNS]:
+                current = get_dns_servers(k)
+                current_v6 = get_dns_servers_v6(k)
+                if current == [LOCAL_DNS] or current_v6 == [LOCAL_DNS_V6]:
                     # Последняя линия обороны — принудительный DHCP
-                    ok2, _ = reset_dns_servers(adapter_key(a))
+                    ok2, _ = reset_dns_servers(k)
                     flush_dns_cache()
-                    current = get_dns_servers(adapter_key(a))
-                    self.q.put(("log", "   ⚠ DNS всё ещё был 127.0.0.1 — принудительно "
+                    current = get_dns_servers(k)
+                    current_v6 = get_dns_servers_v6(k)
+                    self.q.put(("log", "   ⚠ Локальный DNS ещё оставался — принудительно "
                                        f"переведён в DHCP: {'успешно' if ok2 else 'не удалось'}"))
-                if current == [LOCAL_DNS]:
-                    self.q.put(("log", "   ✘ Не удалось убрать 127.0.0.1! Откройте "
+                if current == [LOCAL_DNS] or current_v6 == [LOCAL_DNS_V6]:
+                    self.q.put(("log", "   ✘ Не удалось убрать 127.0.0.1/::1! Откройте "
                                        "свойства адаптера и выберите "
                                        "«Получить адрес DNS-сервера автоматически»."))
                 else:
+                    restored = current + current_v6
                     self.q.put(("log", f"   ✔ Откат подтверждён, текущие DNS: "
-                                       f"{', '.join(current) or 'авто (DHCP)'}"))
-                self.q.put(("status", (a, current)))
+                                       f"{', '.join(restored) or 'авто (DHCP)'}"))
+                self.q.put(("status", (a, current, current_v6)))
             self.q.put(("log", "✔ Отключено, обычный интернет работает как раньше."))
             if quit_after:
                 self.q.put(("quit", None))
@@ -1658,6 +2200,59 @@ class App(tk.Tk):
             else:
                 self.q.put(("log", f"   ✘ Ни один апстрим не отвечает: {last_err}"))
         self._run_async(work_upstream)
+
+    def _on_log_saved(self, path: str):
+        if messagebox.askyesno(
+            APP_NAME,
+            f"Диагностический лог сохранён:\n{path}\n\n"
+            f"Отправьте этот .txt файл разработчику.\n"
+            f"Открыть папку с файлом?",
+        ):
+            try:
+                if IS_WINDOWS:
+                    subprocess.Popen(["explorer", "/select," + os.path.normpath(path)])
+                else:
+                    subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(path))])
+            except OSError:
+                pass
+
+    def on_save_log(self):
+        if self._busy:
+            return
+        fname = f"SecureDNS_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path = filedialog.asksaveasfilename(
+            title="Сохранить журнал диагностики",
+            initialdir=default_log_export_dir(),
+            initialfile=fname,
+            defaultextension=".txt",
+            filetypes=[("Текстовый файл", "*.txt"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        sel = self._selected_adapter()
+        state = {
+            "adapter": f"{sel['name']} — {sel['desc']}" if sel else None,
+            "ips": self.ent_ips.get().strip(),
+            "proto": self.var_proto.get(),
+            "sni": self.ent_sni.get().strip(),
+            "doh_url": self.ent_doh.get().strip(),
+            "verify": bool(self.var_verify.get()),
+            "block_v6_quic": bool(self.var_block_v6_quic.get()),
+            "proxy_running": self.proxy is not None,
+            "proxy_stats": self.proxy.get_stats() if self.proxy else None,
+        }
+        ui_text = self.txt_log.get("1.0", "end-1c")
+
+        def work():
+            try:
+                saved = save_diagnostics_report(path, app_state=state, ui_log_text=ui_text)
+                self.q.put(("log", f"✔ Журнал диагностики сохранён: {saved}"))
+                self.q.put(("log_saved", saved))
+            except Exception as e:  # noqa: BLE001
+                write_log_file(traceback.format_exc(), level="ERROR")
+                self.q.put(("log", f"✘ Не удалось сохранить лог: {e}"))
+
+        self._run_async(work)
 
     def on_close(self):
         if self.proxy and self.active_adapter:
@@ -1721,9 +2316,9 @@ def _cli_build_upstreams():
     if proto == "dot":
         sni = None
         if verify:
-            sni = _cli_input("Домен сертификата для проверки (сертификат обычно "
-                             "выпущен на домен, а не на IP; пусто — проверять по IP)")
-            sni = sni or None
+            raw_sni = _cli_input("Домен сертификата для проверки (сертификат обычно "
+                                 "выпущен на домен, а не на IP; пусто — проверять по IP)")
+            sni = _clean_sni_host(raw_sni)
         return [DoTUpstream(ip, 853, verify=verify, hostname=sni) for ip in ips], \
                f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "")
     while True:
@@ -1751,7 +2346,13 @@ def cli_main():
         print("✘ SecureDNS уже запущен в другом окне.")
         return 1
     try:
-        startup_rollback(print)
+        log_session_header("CLI")
+
+        def cli_log(msg: str):
+            print(msg)
+            write_log_file(msg)
+
+        startup_rollback(cli_log)
         # Проверка обновлений
         info = check_for_update_info()
         if info:
@@ -1759,7 +2360,7 @@ def cli_main():
             print(f"⬆ Доступна новая версия {new_ver} (у вас {APP_VERSION}).")
             if _cli_input("Обновить сейчас? (y/n)", "n").lower() == "y":
                 res = do_update(
-                    print,
+                    cli_log,
                     download_url=info.get("url"),
                     expected_size=info.get("size"),
                     on_before_restart=release_single_instance,
@@ -1798,6 +2399,7 @@ def cli_main():
             if not built:
                 return
             upstreams, desc = built
+            block_v6_quic = _cli_input("Блокировать IPv6 и QUIC для SmartDNS/ИИ? (y/n)", "y").lower() != "n"
             print(f"▶ Проверяю апстрим ({desc})…")
             q = build_dns_query("example.com")
             ok_up = False
@@ -1818,20 +2420,23 @@ def cli_main():
                 return
             if active and adapter_key(active) != adapter_key(a):
                 prev_k = adapter_key(active)
-                if get_dns_servers(prev_k) == [LOCAL_DNS]:
+                if get_dns_servers(prev_k) == [LOCAL_DNS] or get_dns_servers_v6(prev_k) == [LOCAL_DNS_V6]:
                     _, prev_msg = restore_adapter_dns(prev_k)
                     print(f"  Предыдущий адаптер «{active['name']}»: {prev_msg}")
             key = adapter_key(a)
             old = get_dns_servers(key)
-            if old == [LOCAL_DNS]:
-                print("  На адаптере уже 127.0.0.1 — прежний бэкап DNS сохранён.")
+            old_v6 = get_dns_servers_v6(key)
+            if old == [LOCAL_DNS] or old_v6 == [LOCAL_DNS_V6]:
+                save_backup(key, old, old_v6)
+                print("  На адаптере уже адрес SecureDNS — прежний бэкап сохранён.")
             else:
-                save_backup(key, old)
-                print(f"  Резервная копия DNS: {old or 'авто (DHCP)'}")
+                save_backup(key, old, old_v6)
+                old_all = list(old or []) + list(old_v6 or [])
+                print(f"  Резервная копия DNS: {old_all or 'авто (DHCP)'}")
             if proxy:
                 proxy.stop()
                 proxy = None
-            proxy = LocalDNSProxy(upstreams)
+            proxy = LocalDNSProxy(upstreams, block_v6_quic=block_v6_quic)
             try:
                 proxy.start()
             except OSError as e:
@@ -1839,7 +2444,8 @@ def cli_main():
                 proxy = None
                 return
             active = a
-            ok, err = set_dns_servers(key, [LOCAL_DNS])
+            target_dns = [LOCAL_DNS, LOCAL_DNS_V6] if (IS_WINDOWS and block_v6_quic and proxy.ipv6_bound) else [LOCAL_DNS]
+            ok, err = set_dns_servers(key, target_dns)
             if not ok:
                 print(f"  ✘ Ошибка смены DNS: {err}")
                 proxy.stop()
@@ -1858,18 +2464,21 @@ def cli_main():
             a = active or (get_adapters() or [None])[0]
             active = None
             if a:
-                ok, msg = restore_adapter_dns(adapter_key(a))
+                k = adapter_key(a)
+                ok, msg = restore_adapter_dns(k)
                 flush_dns_cache()
                 print(f"  {msg}")
-                cur = get_dns_servers(adapter_key(a))
-                if cur == [LOCAL_DNS]:
-                    ok2, _ = reset_dns_servers(adapter_key(a))
+                cur = get_dns_servers(k)
+                cur_v6 = get_dns_servers_v6(k)
+                if cur == [LOCAL_DNS] or cur_v6 == [LOCAL_DNS_V6]:
+                    ok2, _ = reset_dns_servers(k)
                     flush_dns_cache()
-                    cur = get_dns_servers(adapter_key(a))
-                    print("  ⚠ DNS всё ещё был 127.0.0.1 — принудительно переведён в DHCP: "
+                    cur = get_dns_servers(k)
+                    cur_v6 = get_dns_servers_v6(k)
+                    print("  ⚠ Локальный DNS ещё оставался — принудительно переведён в DHCP: "
                           + ("успешно" if ok2 else "не удалось"))
-                print("  ✔ Откат подтверждён." if cur != [LOCAL_DNS]
-                      else "  ✘ DNS всё ещё 127.0.0.1 — проверьте вручную!")
+                print("  ✔ Откат подтверждён." if (cur != [LOCAL_DNS] and cur_v6 != [LOCAL_DNS_V6])
+                      else "  ✘ DNS всё ещё 127.0.0.1/::1 — проверьте вручную!")
             print("✔ Отключено.")
 
         def test():
@@ -1886,9 +2495,28 @@ def cli_main():
             else:
                 print("  Прокси не запущен. Сначала включите (пункт 2).")
 
+        def save_log():
+            default_path = os.path.join(
+                default_log_export_dir(),
+                f"SecureDNS_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            )
+            path = _cli_input("Путь к файлу лога", default_path)
+            if not path:
+                return
+            state = {
+                "adapter": f"{active['name']} — {active['desc']}" if active else None,
+                "proxy_running": proxy is not None,
+                "proxy_stats": proxy.get_stats() if proxy else None,
+            }
+            try:
+                saved = save_diagnostics_report(path, app_state=state)
+                cli_log(f"✔ Журнал диагностики сохранён: {saved}")
+            except Exception as e:  # noqa: BLE001
+                cli_log(f"✘ Не удалось сохранить лог: {e}")
+
         try:
             while True:
-                print("\n  1) Статус   2) Включить   3) Отключить   4) Проверить   5) Выход")
+                print("\n  1) Статус   2) Включить   3) Отключить   4) Проверить   5) Сохранить лог (.txt)   6) Выход")
                 cmd = _cli_input("Выбор")
                 if cmd == "1":
                     show_status()
@@ -1898,7 +2526,9 @@ def cli_main():
                     disable()
                 elif cmd == "4":
                     test()
-                elif cmd in ("5", "q", "й"):
+                elif cmd == "5":
+                    save_log()
+                elif cmd in ("6", "q", "й"):
                     break
                 elif cmd == "":
                     continue
