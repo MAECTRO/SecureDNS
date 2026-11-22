@@ -36,13 +36,31 @@
 
 ### Linux
 
-Зависимости: Python 3.10+ и `python3-tk` (в Debian/Ubuntu: `sudo apt install python3-tk`).
-Смена DNS работает через `resolvectl` (systemd-resolved), `nmcli`
-(NetworkManager) или правку `/etc/resolv.conf` — выбирается автоматически.
+Файл `SecureDNS.exe` — это Windows-бинарник, на Linux он не нужен.
+Запускается исходник `main.py` (Python 3.10+).
+
+Самый простой путь — готовый лаунчер (сам проверит зависимости и поднимет
+права):
 
 ```
+chmod +x securedns.sh
+./securedns.sh
+```
+
+Если вдруг вручную — зависимости и запуск:
+
+```
+# Debian/Ubuntu:  sudo apt install python3-tk
+# Fedora:         sudo dnf install python3-tkinter
+# Arch:           sudo pacman -S tk
+
+xhost +SI:localuser:root   # разрешить root доступ к экрану (Wayland/X11)
 sudo -E python3 main.py
 ```
+
+Смена DNS работает через `resolvectl` (systemd-resolved), `nmcli`
+(NetworkManager) или правку `/etc/resolv.conf` — выбирается автоматически,
+на Ubuntu/Fedora ничего настраивать не надо.
 
 Дальше всё то же самое: впишите свои серверы, выберите DoT или DoH, включите.
 
