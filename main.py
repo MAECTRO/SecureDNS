@@ -37,7 +37,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -443,6 +443,7 @@ def do_update(log, download_url=None, expected_size=None, on_before_restart=None
                 "        }\n"
                 "    }\n"
                 "    if ($moved) {\n"
+                "        Get-ChildItem Env: | Where-Object { $_.Name -like '_PYI_*' -or $_.Name -like '_MEIPASS*' } | Remove-Item -Force -ErrorAction SilentlyContinue\n"
                 "        Start-Process -FilePath $Exe -WorkingDirectory $WorkDir\n"
                 "    }\n"
                 "} finally {\n"
@@ -451,6 +452,10 @@ def do_update(log, download_url=None, expected_size=None, on_before_restart=None
             )
             with open(ps1_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
                 f.write(ps1_script)
+            clean_env = {
+                k: v for k, v in os.environ.items()
+                if not k.upper().startswith(("_PYI_", "_MEIPASS"))
+            }
             subprocess.Popen(
                 [
                     "powershell.exe",
@@ -464,6 +469,7 @@ def do_update(log, download_url=None, expected_size=None, on_before_restart=None
                 ],
                 creationflags=0x08000000 | 0x00000200,
                 close_fds=True,
+                env=clean_env,
             )
             log("  ✔ Обновление скачано, перезапускаюсь…")
             return "restart"
