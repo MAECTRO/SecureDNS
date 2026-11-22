@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -238,7 +238,7 @@ def reset_dns_servers(adapter):
 def flush_dns_cache():
     """Очистить системный кэш DNS (best-effort)."""
     if IS_WINDOWS:
-        flush_dns_cache()
+        run_ps("Clear-DnsClientCache")
         return
     tool = _linux_dns_tool()
     if tool in ("resolvectl", "systemd-resolve"):
@@ -248,6 +248,92 @@ def flush_dns_cache():
 def adapter_key(a):
     """Идентификатор адаптера для DNS-операций: ifindex (Windows) или имя (Linux)."""
     return a["index"] if IS_WINDOWS else a["name"]
+
+
+# ---------------------------------------------------------------------------
+# Автообновление (GitHub)
+# ---------------------------------------------------------------------------
+
+UPDATE_VERSION_URL = "https://raw.githubusercontent.com/MAECTRO/SecureDNS/main/version.txt"
+UPDATE_EXE_URL = "https://github.com/MAECTRO/SecureDNS/releases/latest/download/SecureDNS.exe"
+UPDATE_SRC_URL = "https://raw.githubusercontent.com/MAECTRO/SecureDNS/main/main.py"
+
+
+def _fetch(url: str, timeout: float = 8.0) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"SecureDNS/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _parse_ver(s: str):
+    try:
+        return tuple(int(x) for x in s.strip().split("."))
+    except ValueError:
+        return (0,)
+
+
+def check_for_update():
+    """Возвращает строку новой версии, если на GitHub есть новее, иначе None."""
+    try:
+        remote = _fetch(UPDATE_VERSION_URL).decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 — сети нет/репо недоступен: молча пропускаем
+        return None
+    return remote if _parse_ver(remote) > _parse_ver(APP_VERSION) else None
+
+
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def do_update(log):
+    """Скачивает и применяет обновление.
+    Возвращает 'restart' (перезапустится сам), 'manual' (нужен ручной перезапуск),
+    либо None при ошибке."""
+    try:
+        if is_frozen():
+            # Windows exe: качаем новый бинарник рядом и подменяем через .bat
+            exe = os.path.abspath(sys.executable)
+            new_exe = exe + ".new"
+            log("  Скачиваю новую версию…")
+            data = _fetch(UPDATE_EXE_URL, timeout=60.0)
+            if len(data) < 1_000_000 or not data.startswith(b"MZ"):
+                log("  ✘ Скачанное не похоже на exe. Обновление отменено.")
+                return None
+            with open(new_exe, "wb") as f:
+                f.write(data)
+            bat = os.path.join(os.path.dirname(exe), "securedns_update.bat")
+            with open(bat, "w", encoding="ascii") as f:
+                f.write("@echo off\r\n"
+                        "timeout /t 2 /nobreak >nul\r\n"
+                        f'move /y "{new_exe}" "{exe}"\r\n'
+                        f'start "" "{exe}"\r\n'
+                        'del "%~f0"\r\n')
+            subprocess.Popen(["cmd", "/c", bat],
+                             creationflags=0x00000008 | 0x00000200,  # detached
+                             close_fds=True)
+            log("  ✔ Обновление скачано, перезапускаюсь…")
+            return "restart"
+        # Запуск из исходников: подменяем main.py
+        log("  Скачиваю новую версию исходников…")
+        data = _fetch(UPDATE_SRC_URL, timeout=30.0)
+        text = data.decode("utf-8")
+        if "APP_VERSION" not in text or "LocalDNSProxy" not in text:
+            log("  ✘ Скачанное не похоже на main.py. Обновление отменено.")
+            return None
+        compile(text, "main.py", "exec")  # проверка синтаксиса до подмены
+        target = os.path.abspath(__file__)
+        with open(target + ".bak", "w", encoding="utf-8", newline="") as f:
+            with open(target, "r", encoding="utf-8") as old:
+                f.write(old.read())
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        log("  ✔ main.py обновлён (старый сохранён как main.py.bak). "
+            "Перезапустите программу.")
+        return "manual"
+    except Exception as e:  # noqa: BLE001
+        log(f"  ✘ Ошибка обновления: {e}")
+        return None
 
 
 def restore_adapter_dns(key):
@@ -618,6 +704,7 @@ class App(tk.Tk):
         self._poll_queue()
         self.after(100, self.refresh_status)
         self.after(600, self._startup_rollback)
+        self.after(2000, self._check_update_bg)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -650,6 +737,7 @@ class App(tk.Tk):
 
         header = ttk.Frame(self)
         header.pack(fill="x", padx=16, pady=(14, 6))
+        self.header = header
         ttk.Label(header, text="🛡  SecureDNS", style="Title.TLabel").pack(side="left")
         self.lbl_admin = ttk.Label(header,
                                    text="права ✓" if is_admin() else "нет прав",
@@ -710,6 +798,14 @@ class App(tk.Tk):
         self.ent_doh = ttk.Entry(row)
         self.ent_doh.insert(0, "https://example.com/dns-query")
 
+        # Домен сертификата (SNI) для DoT
+        self.frm_sni = ttk.Frame(row)
+        ttk.Label(self.frm_sni, text="Домен сертификата (для проверки TLS по IP, "
+                                     "необязательно):", style="Muted.TLabel").pack(anchor="w")
+        self.ent_sni = ttk.Entry(self.frm_sni)
+        self.ent_sni.pack(fill="x", pady=(2, 0))
+        self.frm_sni.pack(fill="x", pady=(4, 0))
+
         # TLS-сертификат
         self.var_verify = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="Проверять TLS-сертификат сервера "
@@ -767,6 +863,13 @@ class App(tk.Tk):
                     self._apply_status(*payload)
                 elif kind == "proxy":
                     self._apply_proxy_state(payload)
+                elif kind == "update":
+                    self._show_update_button(payload)
+                elif kind == "quit":
+                    if self.proxy:
+                        self.proxy.stop()
+                        self.proxy = None
+                    self.destroy()
                 elif kind == "done":
                     self.btn_on.configure(state="normal")
         except queue.Empty:
@@ -776,6 +879,7 @@ class App(tk.Tk):
     def _on_proto(self):
         if self.var_proto.get() == "doh":
             self.ent_doh.pack(fill="x", pady=(4, 0))
+            self.frm_sni.pack_forget()
             self.lbl_ips.config(text="IP DoH-сервера (рекомендуется — прямое подключение "
                                      "без DNS-резолва):")
             self.lbl_ips_hint.config(
@@ -783,9 +887,45 @@ class App(tk.Tk):
                      "Если оставить пустым, домен резолвится заранее.")
         else:
             self.ent_doh.pack_forget()
+            self.frm_sni.pack(fill="x", pady=(4, 0))
             self.lbl_ips.config(text="Ваши DNS-серверы (IP через запятую — любые):")
             self.lbl_ips_hint.config(text="Порядок важен: при недоступности первого "
                                           "запросы уходят на следующий.")
+
+    # ---------- автообновление ----------
+    def _check_update_bg(self):
+        def work():
+            v = check_for_update()
+            if v:
+                self.q.put(("update", v))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update_button(self, version: str):
+        if getattr(self, "_update_shown", False):
+            return
+        self._update_shown = True
+        btn = ttk.Button(self.header, text=f"⬆ Обновить до {version}",
+                         command=lambda: self.on_update(version))
+        btn.pack(side="right", padx=(0, 10))
+        self.log(f"⬆ Доступна новая версия {version} (у вас {APP_VERSION}) — "
+                 f"кнопка обновления в шапке.")
+
+    def on_update(self, version: str):
+        if not messagebox.askyesno(
+                APP_NAME,
+                f"Доступна версия {version} (у вас {APP_VERSION}).\n\n"
+                f"Скачать и обновить сейчас?\n"
+                f"Если защита включена, после перезапуска её надо будет включить заново."):
+            return
+
+        def work():
+            self.q.put(("log", f"▶ Обновление до {version}…"))
+            res = do_update(self._thread_log)
+            if res == "restart":
+                self.q.put(("quit", None))
+            elif res == "manual":
+                self.q.put(("log", "Закройте программу и запустите её снова."))
+        self._run_async(work)
 
     def _selected_adapter(self):
         i = self.cmb_adapter.current()
@@ -794,8 +934,7 @@ class App(tk.Tk):
     def _parse_ips(self):
         ips = [s.strip() for s in self.ent_ips.get().split(",") if s.strip()]
         for ip in ips:
-            parts = ip.split(".")
-            if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            if not _valid_ip(ip):
                 return None
         return ips
 
@@ -810,8 +949,17 @@ class App(tk.Tk):
             if not ips:
                 messagebox.showerror(APP_NAME, "Для DoT впишите хотя бы один IP сервера.")
                 return None
-            return [DoTUpstream(ip, 853, verify=verify) for ip in ips], \
-                   f"DoT:853 → {', '.join(ips)}"
+            sni = self.ent_sni.get().strip() or None
+            if verify and not sni:
+                if not messagebox.askyesno(
+                        APP_NAME,
+                        "Включена проверка сертификата, но «Домен сертификата» не задан.\n"
+                        "Сертификат сервера обычно выпущен на домен, а не на IP —\n"
+                        "проверка, скорее всего, не пройдёт (IP address mismatch).\n\n"
+                        "Продолжить без домена?"):
+                    return None
+            return [DoTUpstream(ip, 853, verify=verify, hostname=sni) for ip in ips], \
+                   f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "")
         url = self.ent_doh.get().strip()
         if not url.startswith("https://"):
             messagebox.showerror(APP_NAME, "DoH-шаблон должен начинаться с https://")
@@ -831,6 +979,9 @@ class App(tk.Tk):
                 self.ent_ips.insert(0, ips)
             self.var_proto.set(cfg.get("proto", "dot"))
             self.var_verify.set(bool(cfg.get("verify", False)))
+            if cfg.get("sni"):
+                self.ent_sni.delete(0, "end")
+                self.ent_sni.insert(0, cfg["sni"])
             if cfg.get("doh_url"):
                 self.ent_doh.delete(0, "end")
                 self.ent_doh.insert(0, cfg["doh_url"])
@@ -846,6 +997,7 @@ class App(tk.Tk):
                     "ips": self.ent_ips.get().strip(),
                     "proto": self.var_proto.get(),
                     "verify": self.var_verify.get(),
+                    "sni": self.ent_sni.get().strip(),
                     "doh_url": self.ent_doh.get().strip(),
                 }, f, ensure_ascii=False, indent=2)
         except OSError:
@@ -1084,8 +1236,13 @@ def _cli_build_upstreams():
               "Домен сюда вписывать не надо — он спросится дальше.")
     verify = _cli_input("Проверять TLS-сертификат сервера? (y/n)", "n").lower() == "y"
     if proto == "dot":
-        return [DoTUpstream(ip, 853, verify=verify) for ip in ips], \
-               f"DoT:853 → {', '.join(ips)}"
+        sni = None
+        if verify:
+            sni = _cli_input("Домен сертификата для проверки (сертификат обычно "
+                             "выпущен на домен, а не на IP; пусто — проверять по IP)")
+            sni = sni or None
+        return [DoTUpstream(ip, 853, verify=verify, hostname=sni) for ip in ips], \
+               f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "")
     while True:
         url = _cli_input("DoH-шаблон (https://..., пусто — отмена)")
         if not url:
@@ -1109,6 +1266,13 @@ def cli_main():
         print(f"✘ Нужны права root. Запустите: sudo python3 main.py --cli")
         return 1
     startup_rollback(print)
+    # Проверка обновлений
+    new_ver = check_for_update()
+    if new_ver:
+        print(f"⬆ Доступна новая версия {new_ver} (у вас {APP_VERSION}).")
+        if _cli_input("Обновить сейчас? (y/n)", "n").lower() == "y":
+            if do_update(print):
+                return 0
     proxy = None
     active = None
 
