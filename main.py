@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -250,6 +250,23 @@ def adapter_key(a):
     return a["index"] if IS_WINDOWS else a["name"]
 
 
+# Порт «замка» единственного экземпляра (не имеет отношения к DNS)
+SINGLE_INSTANCE_ADDR = (LOCAL_DNS, 53177)
+
+
+def acquire_single_instance():
+    """Не даём запустить вторую копию: держим TCP-сокет на служебном порту.
+    Возвращает сокет-замок (держать открытым) или None, если копия уже есть."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(SINGLE_INSTANCE_ADDR)
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
 def save_backup(if_index: int, servers):
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -430,12 +447,10 @@ class LocalDNSProxy:
 
     def start(self):
         self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._udp.bind((LOCAL_DNS, 53))
         self._udp.settimeout(1.0)
 
         self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._tcp.bind((LOCAL_DNS, 53))
         self._tcp.listen(16)
         self._tcp.settimeout(1.0)
@@ -1026,4 +1041,16 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    _guard = acquire_single_instance()
+    if _guard is None:
+        _r = tk.Tk()
+        _r.withdraw()
+        messagebox.showwarning(
+            APP_NAME,
+            "SecureDNS уже запущен.\n\n"
+            "Вторая копия не нужна: DNS-порт 53 один, и две программы "
+            "начали бы за него драться. Найдите окно уже запущенной "
+            "копии и работайте в ней.")
+        _r.destroy()
+        sys.exit(0)
     App().mainloop()
