@@ -48,7 +48,7 @@ except ImportError:
     winreg = None
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.5.1"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -1384,11 +1384,11 @@ def _connect_tls_once(ip: str, port: int, ctx: ssl.SSLContext, server_hostname: 
 
 def _connect_tls_smart(ip: str, port: int, ctx: ssl.SSLContext, server_hostname: str | None,
                        connect_timeout: float, io_timeout: float, split_hello: bool = False):
-    """Открывает TLS-сокет с быстрым ретраем при потерях и фоллбэком на резку ClientHello для :443."""
+    """Открывает TLS-сокет с быстрым ретраем при потерях и фоллбэком между резкой и цельным ClientHello."""
     if port == 443:
         attempts = [True, True, False] if split_hello else [False, False, True]
     else:
-        attempts = [True, True] if split_hello else [False, False]
+        attempts = [True, False] if split_hello else [False, False]
 
     last_err = None
     for use_split in attempts:
@@ -1411,7 +1411,7 @@ class DoTUpstream:
 
     def __init__(self, ip: str, port: int = 853, verify: bool = False,
                  hostname: str | None = None, timeout: float = 6.0,
-                 split_hello: bool = False, connect_timeout: float = 2.0):
+                 split_hello: bool = False, connect_timeout: float = 4.0):
         self.ip, self.port, self.timeout = ip, port, timeout
         self.connect_timeout = min(float(connect_timeout), float(timeout))
         self.hostname = hostname
@@ -1521,7 +1521,7 @@ class DoHUpstream:
     def __init__(self, url: str, verify: bool = True,
                  bootstrap_ip: str | None = None, timeout: float = 6.0,
                  bootstrap_ips: list[str] | None = None,
-                 split_hello: bool = False, connect_timeout: float = 2.0,
+                 split_hello: bool = False, connect_timeout: float = 4.0,
                  defer_resolve: bool = False, bootstrap_dns_ips: list[str] | None = None):
         from urllib.parse import urlparse
         u = urlparse(url)
@@ -1866,8 +1866,8 @@ def _strict_doh_probe(ip: str, host: str, port: int, path: str, verify: bool, us
     """Строгий однопопыточный DoH-тест конкретного порта и режима TLS без фоллбэков."""
     ctx = make_ssl_context(verify, host)
     t0 = time.monotonic()
-    sock = _connect_tls_once(ip, port, ctx, host, connect_timeout=2.5, io_timeout=3.0, use_split=use_split)
-    conn = http.client.HTTPSConnection(host, port, timeout=3.0)
+    sock = _connect_tls_once(ip, port, ctx, host, connect_timeout=4.0, io_timeout=5.0, use_split=use_split)
+    conn = http.client.HTTPSConnection(host, port, timeout=5.0)
     conn.sock = sock
     host_hdr = host if port == 443 else f"{host}:{port}"
     try:
@@ -1897,7 +1897,7 @@ def probe_transports(ips: list[str], doh_url: str = "", sni: str | None = None,
 
     def run_dot(ip: str):
         t0 = time.monotonic()
-        up = DoTUpstream(ip, 853, verify=verify, hostname=sni, timeout=3.0, connect_timeout=2.5)
+        up = DoTUpstream(ip, 853, verify=verify, hostname=sni, timeout=5.0, connect_timeout=4.0)
         try:
             resp = up.query(q)
             ms = int((time.monotonic() - t0) * 1000)
@@ -1905,10 +1905,10 @@ def probe_transports(ips: list[str], doh_url: str = "", sni: str | None = None,
         finally:
             up.close()
 
-    def run_tls_ping(ip: str, port: int):
+    def run_tls_ping(ip: str, port: int, use_split: bool = False):
         t0 = time.monotonic()
         ctx = make_ssl_context(verify and bool(sni), sni)
-        s = _connect_tls_once(ip, port, ctx, sni, connect_timeout=2.5, io_timeout=2.5, use_split=False)
+        s = _connect_tls_once(ip, port, ctx, sni, connect_timeout=4.0, io_timeout=4.0, use_split=use_split)
         try:
             ms = int((time.monotonic() - t0) * 1000)
             return True, f"✔ TLS рукопожатие {ms} мс"
@@ -1933,8 +1933,9 @@ def probe_transports(ips: list[str], doh_url: str = "", sni: str | None = None,
                           lambda p=probe_ip, h=host, pa=path: (True, _strict_doh_probe(p, h, 8443, pa, verify, False))))
     else:
         for ip in ips[:1]:
-            tasks.append((f"TLS :443 ({ip})", lambda ip=ip: run_tls_ping(ip, 443)))
-            tasks.append((f"TLS :8443 ({ip})", lambda ip=ip: run_tls_ping(ip, 8443)))
+            tasks.append((f"TLS :443 цельный ({ip})", lambda ip=ip: run_tls_ping(ip, 443, False)))
+            tasks.append((f"TLS :443 резка 3B ({ip})", lambda ip=ip: run_tls_ping(ip, 443, True)))
+            tasks.append((f"TLS :8443 ({ip})", lambda ip=ip: run_tls_ping(ip, 8443, False)))
 
     if not tasks:
         return []
