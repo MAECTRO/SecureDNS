@@ -17,6 +17,10 @@
   резервный фоллбэк после сбоя обычного рукопожатия).
 - Опция **«Блокировать IPv6 и QUIC»** отсекает `AAAA`, `SVCB` и `HTTPS` запросы,
   чтобы браузеры не утекали мимо SmartDNS/ИИ по IPv6 или HTTP/3.
+- Опция **«Раздельный DNS»** с редактируемым списком доменов (включая готовый
+  пресет Gemini, ChatGPT, Claude, Grok, Perplexity, Cursor, Copilot): выбранные
+  домены и их поддомены идут через ваш шифрованный SmartDNS (с защитой от
+  IPv6/QUIC), а весь остальной трафик — напрямую через DNS провайдера.
 - Системе назначает DNS `127.0.0.1`:
   - **Windows** — через `Set-DnsClientServerAddress`;
   - **Linux** — через systemd-resolved (`resolvectl`), NetworkManager (`nmcli`)

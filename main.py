@@ -42,12 +42,48 @@ from tkinter import ttk, messagebox, filedialog
 import traceback
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
 LOCAL_DNS_V6 = "::1"
 BLOCKED_V6_QUIC_QTYPES = {28, 64, 65}  # AAAA, SVCB, HTTPS
+DEFAULT_SPLIT_DOMAINS = (
+    # Google Gemini / AI Studio
+    "gemini.google.com",
+    "aistudio.google.com",
+    "ai.google.dev",
+    "alkalimakersuite-pa.clients6.google.com",
+    "generativelanguage.googleapis.com",
+    "proactivebackend-pa.googleapis.com",
+    "robinfrontend-pa.googleapis.com",
+    "geller-pa.googleapis.com",
+    "assistant-s3-pa.googleapis.com",
+    "waa-pa.clients6.google.com",
+    "notebooklm.google.com",
+    "labs.google",
+    "jules.google.com",
+    "deepmind.google",
+    # OpenAI / ChatGPT / Sora
+    "chatgpt.com",
+    "openai.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "sora.com",
+    # Anthropic / Claude
+    "claude.ai",
+    "anthropic.com",
+    "claudeusercontent.com",
+    # xAI / Perplexity / Cursor / Copilot
+    "grok.com",
+    "x.ai",
+    "perplexity.ai",
+    "cursor.com",
+    "cursor.sh",
+    "copilot.microsoft.com",
+    "githubcopilot.com",
+)
+FALLBACK_DIRECT_DNS = ("77.88.8.8", "77.88.8.1")
 if IS_WINDOWS:
     BACKUP_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "SecureDNS")
 else:
@@ -1243,6 +1279,121 @@ class DoHUpstream:
                 pass
 
 
+def parse_split_domains(raw) -> tuple[str, ...]:
+    """Разбирает строку/список доменов (поддержка #, *, URL, запятых, переносов строк)."""
+    if isinstance(raw, (list, tuple, set)):
+        raw_text = "\n".join(str(x) for x in raw)
+    else:
+        raw_text = str(raw or "")
+    out = []
+    seen = set()
+    for line in raw_text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for tok in re.split(r"[\s,;]+", line):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if "://" in tok or "/" in tok:
+                host = _clean_sni_host(tok) or ""
+            else:
+                host = tok.split(":", 1)[0]
+            while host.startswith("*."):
+                host = host[2:]
+            host = host.strip(".*").lower()
+            if not host or "." not in host or ".." in host:
+                continue
+            if not all(ch.isalnum() or ch in "-._" for ch in host):
+                continue
+            if host not in seen:
+                seen.add(host)
+                out.append(host)
+    return tuple(out)
+
+
+def match_split_domain(qname: str, domains_set) -> bool:
+    """True, если qname совпадает с доменом из списка или является его поддоменом."""
+    if not qname or not domains_set or qname.startswith("<"):
+        return False
+    q = qname.strip().rstrip(".").lower()
+    if not q:
+        return False
+    while True:
+        if q in domains_set:
+            return True
+        dot = q.find(".")
+        if dot == -1:
+            return False
+        q = q[dot + 1:]
+
+
+class PlainUDPUpstream:
+    """Обычный UDP/TCP:53 апстрим для прямого трафика мимо SmartDNS (без цикла на 127.0.0.1)."""
+
+    def __init__(self, ip: str, port: int = 53, timeout: float = 2.5):
+        if not _valid_ip(ip):
+            raise ValueError(f"некорректный прямой DNS IP: {ip}")
+        self.ip = ip
+        self.port = int(port)
+        self.timeout = float(timeout)
+
+    def query(self, packet: bytes) -> bytes:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(self.timeout)
+            s.sendto(packet, (self.ip, self.port))
+            resp, _ = s.recvfrom(4096)
+        if len(resp) < 2 or (len(packet) >= 2 and resp[:2] != packet[:2]):
+            raise IOError("некорректный UDP-ответ DNS")
+        if len(resp) >= 3 and (resp[2] & 0x02):  # TC=1 -> дочитываем по TCP
+            with socket.create_connection((self.ip, self.port), timeout=self.timeout) as ts:
+                ts.settimeout(self.timeout)
+                ts.sendall(struct.pack("!H", len(packet)) + packet)
+                ln = struct.unpack("!H", DoTUpstream._recv_exact(ts, 2))[0]
+                if ln < 2:
+                    raise IOError("некорректная длина TCP-ответа DNS")
+                resp = DoTUpstream._recv_exact(ts, ln)
+        return resp
+
+    def close(self):
+        pass
+
+
+def resolve_direct_dns(if_index, pre_old_v4=None, manual_raw: str = "") -> tuple[list[str], str]:
+    """Определяет рабочий прямой IPv4 DNS для не-ИИ доменов при раздельном DNS."""
+    manual_ips = [s.strip() for s in str(manual_raw or "").split(",") if s.strip()]
+    valid_manual = [ip for ip in manual_ips if _valid_ip(ip)]
+    if valid_manual:
+        return list(dict.fromkeys(valid_manual)), "указан вручную"
+
+    valid_old = [ip for ip in (pre_old_v4 or []) if _valid_ip(ip)]
+    if valid_old:
+        return list(dict.fromkeys(valid_old)), "из адаптера"
+
+    bak_v4 = [ip for ip in load_backup(if_index) if _valid_ip(ip)]
+    if bak_v4:
+        return list(dict.fromkeys(bak_v4)), "из бэкапа"
+
+    if IS_WINDOWS and if_index is not None:
+        rc, out, _ = run_ps(
+            f"(Get-NetIPConfiguration -InterfaceIndex {if_index} -ErrorAction SilentlyContinue)"
+            f".IPv4DefaultGateway.NextHop | ConvertTo-Json -Compress",
+            timeout=5,
+        )
+        if rc == 0 and out.strip():
+            try:
+                gw_data = json.loads(out)
+                if isinstance(gw_data, str):
+                    gw_data = [gw_data]
+                valid_gw = [str(ip).strip() for ip in gw_data if _valid_ip(str(ip).strip())]
+                if valid_gw:
+                    return list(dict.fromkeys(valid_gw)), "шлюз роутера"
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return list(FALLBACK_DIRECT_DNS), "резерв (77.88.8.8)"
+
+
 # ---------------------------------------------------------------------------
 # Локальный DNS-прокси (UDP + TCP на 127.0.0.1:53 и ::1:53)
 # ---------------------------------------------------------------------------
@@ -1250,8 +1401,13 @@ class DoHUpstream:
 class LocalDNSProxy:
     def __init__(self, upstreams, on_log=None, bind_port: int = 53,
                  cooldown_sec: float = 30.0, block_v6_quic: bool = False,
-                 bind_ipv6: bool = True):
+                 bind_ipv6: bool = True,
+                 split_domains=None, direct_upstreams=None):
         self.upstreams = list(upstreams)    # список DoTUpstream/DoHUpstream
+        self.direct_upstreams = list(direct_upstreams or [])
+        self.split_domains = parse_split_domains(split_domains)
+        self._split_set = set(self.split_domains)
+        self.split_enabled = bool(self._split_set and self.direct_upstreams)
         self.on_log = on_log or (lambda m: None)
         self.bind_port = bind_port
         self._cooldown_sec = cooldown_sec
@@ -1259,9 +1415,10 @@ class LocalDNSProxy:
         self._bind_ipv6 = bool(bind_ipv6)
         self.ipv6_bound = False
         self._cooldown_until = [0.0] * len(self.upstreams)
+        self._direct_cooldown_until = [0.0] * len(self.direct_upstreams)
         self._cooldown_lock = threading.Lock()
         self._stats_lock = threading.Lock()
-        self._stats = {"total": 0, "ok": 0, "blocked_v6_quic": 0, "err": 0}
+        self._stats = {"total": 0, "ok": 0, "direct_ok": 0, "blocked_v6_quic": 0, "err": 0}
         self._recent = collections.deque(maxlen=40)
         self._stop = threading.Event()
         self._threads = []
@@ -1411,6 +1568,9 @@ class LocalDNSProxy:
                 "bind_port": self.bind_port,
                 "ipv6_bound": self.ipv6_bound,
                 "block_v6_quic": self.block_v6_quic,
+                "split_enabled": self.split_enabled,
+                "split_domains_count": len(self.split_domains),
+                "direct_targets": [getattr(d, "ip", str(d)) for d in self.direct_upstreams],
                 "stats": dict(self._stats),
                 "recent": list(self._recent),
             }
@@ -1435,42 +1595,59 @@ class LocalDNSProxy:
         header = tid + struct.pack("!HHHHH", resp_flags, qdcount if question else 0, 0, 0, 0)
         return header + question
 
-    def _forward(self, packet: bytes) -> bytes:
-        qname, qtype = self._parse_question(packet)
-        if self.block_v6_quic and qtype in BLOCKED_V6_QUIC_QTYPES:
-            nodata = self._build_nodata(packet)
-            if nodata is not None:
-                self._record_query(qname, qtype, "NODATA (blocked IPv6/QUIC)", "blocked_v6_quic")
-                return nodata
-
+    def _query_upstream_pool(self, packet: bytes, upstreams: list, cooldowns: list) -> bytes:
         with self._cooldown_lock:
             now = time.monotonic()
-            ready = [i for i, until in enumerate(self._cooldown_until) if until <= now]
+            ready = [i for i, until in enumerate(cooldowns) if until <= now]
             cooling = sorted(
-                (i for i, until in enumerate(self._cooldown_until) if until > now),
-                key=lambda i: self._cooldown_until[i],
+                (i for i, until in enumerate(cooldowns) if until > now),
+                key=lambda i: cooldowns[i],
             )
             order = ready + cooling
 
         last = None
         for idx in order:
-            up = self.upstreams[idx]
+            up = upstreams[idx]
             try:
                 resp = up.query(packet)
                 with self._cooldown_lock:
-                    self._cooldown_until[idx] = 0.0
-                ans = parse_answers(resp)
-                summary = ", ".join(ans[:4]) if ans else f"OK ({len(resp)} B)"
-                self._record_query(qname, qtype, summary, "ok")
+                    cooldowns[idx] = 0.0
                 return resp
             except Exception as e:  # noqa: BLE001
                 with self._cooldown_lock:
-                    self._cooldown_until[idx] = time.monotonic() + self._cooldown_sec
+                    cooldowns[idx] = time.monotonic() + self._cooldown_sec
                 last = e
                 if not self._stop.is_set():
                     self.on_log(f"   ✘ {e}")
-        self._record_query(qname, qtype, f"ERR: {last}", "err")
         raise IOError(f"все апстримы недоступны ({last})")
+
+    def _forward(self, packet: bytes) -> bytes:
+        qname, qtype = self._parse_question(packet)
+        use_direct = self.split_enabled and not match_split_domain(qname, self._split_set)
+
+        if not use_direct and self.block_v6_quic and qtype in BLOCKED_V6_QUIC_QTYPES:
+            nodata = self._build_nodata(packet)
+            if nodata is not None:
+                self._record_query(qname, qtype, "NODATA (blocked IPv6/QUIC)", "blocked_v6_quic")
+                return nodata
+
+        try:
+            if use_direct:
+                resp = self._query_upstream_pool(packet, self.direct_upstreams, self._direct_cooldown_until)
+                ans = parse_answers(resp)
+                summary = ", ".join(ans[:4]) if ans else f"OK ({len(resp)} B)"
+                self._record_query(qname, qtype, f"[прямой] {summary}", "direct_ok")
+                return resp
+
+            resp = self._query_upstream_pool(packet, self.upstreams, self._cooldown_until)
+            ans = parse_answers(resp)
+            summary = ", ".join(ans[:4]) if ans else f"OK ({len(resp)} B)"
+            prefix = "[SmartDNS] " if self.split_enabled else ""
+            self._record_query(qname, qtype, f"{prefix}{summary}", "ok")
+            return resp
+        except Exception as e:
+            self._record_query(qname, qtype, f"ERR: {e}", "err")
+            raise
 
     @staticmethod
     def _build_servfail(packet: bytes) -> bytes | None:
@@ -1596,6 +1773,8 @@ class LocalDNSProxy:
             pool.shutdown(wait=False, cancel_futures=True)
         for up in self.upstreams:
             up.close()
+        for up in self.direct_upstreams:
+            up.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1704,6 +1883,8 @@ def collect_diagnostics(app_state: dict | None = None, ui_log_text: str = "") ->
             f"Verify TLS: {app_state.get('verify')}",
             f"Block IPv6/QUIC: {app_state.get('block_v6_quic')}",
             f"Split TLS ClientHello: {app_state.get('split_hello')}",
+            f"Split DNS: {app_state.get('split_dns')} ({app_state.get('split_domains_count', 0)} domains)",
+            f"Direct DNS Override: {app_state.get('direct_dns', '')!r}",
             f"Proxy Running: {proxy_running}",
         ])
     else:
@@ -1722,11 +1903,18 @@ def collect_diagnostics(app_state: dict | None = None, ui_log_text: str = "") ->
     proxy_stats = (app_state or {}).get("proxy_stats")
     if proxy_stats:
         st = proxy_stats.get("stats") or {}
+        split_line = ""
+        if proxy_stats.get("split_enabled"):
+            split_line = (
+                f" | SplitDNS: {proxy_stats.get('split_domains_count', 0)} domains "
+                f"-> Direct: {proxy_stats.get('direct_targets')}"
+            )
         lines.extend([
             f"BindPort: {proxy_stats.get('bind_port')} | IPv6Bound: {proxy_stats.get('ipv6_bound')} "
-            f"| BlockV6QUIC: {proxy_stats.get('block_v6_quic')}",
+            f"| BlockV6QUIC: {proxy_stats.get('block_v6_quic')}{split_line}",
             f"Counters: total={st.get('total', 0)}, ok={st.get('ok', 0)}, "
-            f"blocked_v6_quic={st.get('blocked_v6_quic', 0)}, err={st.get('err', 0)}",
+            f"direct_ok={st.get('direct_ok', 0)}, blocked_v6_quic={st.get('blocked_v6_quic', 0)}, "
+            f"err={st.get('err', 0)}",
             "RecentQueries (up to 40):",
         ])
         recent = proxy_stats.get("recent") or []
@@ -1830,8 +2018,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION} — шифрованный DNS (DoT/DoH)")
-        self.geometry("700x755")
-        self.minsize(660, 710)
+        self.geometry("700x770")
+        self.minsize(660, 700)
         self.configure(bg=BG)
         if IS_WINDOWS:
             try:
@@ -1848,6 +2036,9 @@ class App(tk.Tk):
         self._update_info = None
         self.btn_update = None
         self.btn_save_log = None
+        self.btn_split_edit = None
+        self.split_domains = list(DEFAULT_SPLIT_DOMAINS)
+        self.direct_dns_raw = ""
         self.q = queue.Queue()
         log_session_header("GUI")
         self._build_ui()
@@ -1994,6 +2185,23 @@ class App(tk.Tk):
         ttk.Checkbutton(row, text="Резать TLS ClientHello по 3 байта (обход ТСПУ для :443; иначе сработает как фоллбэк)",
                         variable=self.var_split_hello).pack(anchor="w", pady=(2, 0))
 
+        # Раздельный DNS (только ИИ/выбранные домены через SmartDNS, остальное — провайдер)
+        split_row = ttk.Frame(row)
+        split_row.pack(fill="x", pady=(4, 0))
+        self.var_split_dns = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            split_row,
+            text="Раздельный DNS (только домены ИИ через сервер, остальное — провайдер)",
+            variable=self.var_split_dns,
+        ).pack(side="left")
+        self.btn_split_edit = ttk.Button(
+            split_row,
+            text=f"Домены… ({len(self.split_domains)})",
+            style="Small.TButton",
+            command=self.on_edit_split_domains,
+        )
+        self.btn_split_edit.pack(side="right")
+
         # Кнопки
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=16, pady=14)
@@ -2018,7 +2226,7 @@ class App(tk.Tk):
 
         self.txt_log = tk.Text(self, bg="#12141a", fg="#b8c0cc", insertbackground=FG,
                                font=("Consolas", 9), wrap="word", relief="flat",
-                               state="disabled")
+                               height=8, state="disabled")
         self.txt_log.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
         self.log(f"{APP_NAME} {APP_VERSION}. Впишите свои DNS-серверы, выберите протокол "
@@ -2039,7 +2247,7 @@ class App(tk.Tk):
         self._busy = busy
         state = "disabled" if busy else "normal"
         for btn in (self.btn_on, self.btn_off, self.btn_test,
-                    self.btn_refresh, self.btn_save_log, self.btn_update):
+                    self.btn_refresh, self.btn_save_log, self.btn_split_edit, self.btn_update):
             if btn is not None:
                 try:
                     btn.configure(state=state)
@@ -2216,6 +2424,94 @@ class App(tk.Tk):
         return [DoHUpstream(url, verify=verify, bootstrap_ips=[], split_hello=split_hello)], desc
 
     # ---------- конфиг ----------
+    def _update_split_btn_text(self):
+        if self.btn_split_edit is not None:
+            self.btn_split_edit.configure(text=f"Домены… ({len(self.split_domains)})")
+
+    def on_edit_split_domains(self):
+        if self._busy:
+            return
+        win = tk.Toplevel(self)
+        win.title("Раздельный DNS — список доменов")
+        win.geometry("560x500")
+        win.minsize(480, 420)
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        if IS_WINDOWS:
+            try:
+                ico = resource_path("icon.ico")
+                if os.path.exists(ico):
+                    win.iconbitmap(ico)
+            except Exception:  # noqa: BLE001
+                pass
+
+        ttk.Label(
+            win,
+            text="Домены, которые пойдут через шифрованный DNS / SmartDNS:",
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=14, pady=(12, 2))
+        ttk.Label(
+            win,
+            text="По одному в строке (или через запятую). Поддомены включаются сами "
+                 "(например, openai.com заберёт api.openai.com).",
+            style="Muted.TLabel",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        txt = tk.Text(
+            win, bg="#12141a", fg=FG, insertbackground=FG,
+            font=("Consolas", 10), wrap="word", relief="flat", height=14,
+        )
+        txt.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        txt.insert("1.0", "\n".join(self.split_domains))
+
+        ttk.Label(
+            win,
+            text="Прямой DNS провайдера (для всех остальных сайтов, необязательно):",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=14)
+        ent_dir = ttk.Entry(win)
+        ent_dir.pack(fill="x", padx=14, pady=(2, 2))
+        ent_dir.insert(0, self.direct_dns_raw)
+        ttk.Label(
+            win,
+            text="Если оставить пустым — возьмём автоматически с адаптера перед включением.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        def on_save():
+            raw_dir = ent_dir.get().strip()
+            if raw_dir:
+                bad = [ip.strip() for ip in raw_dir.split(",") if ip.strip() and not _valid_ip(ip.strip())]
+                if bad:
+                    messagebox.showerror(
+                        APP_NAME,
+                        f"Некорректный прямой DNS: {', '.join(bad)}\nУкажите IPv4 (не 127.0.0.1) или оставьте пустым.",
+                        parent=win,
+                    )
+                    return
+            parsed = list(parse_split_domains(txt.get("1.0", "end")))
+            self.split_domains = parsed
+            self.direct_dns_raw = raw_dir
+            self._update_split_btn_text()
+            self._save_config()
+            if self.proxy is not None:
+                self.log("ℹ Список раздельного DNS обновлён — нажмите «Отключить» и «Включить», чтобы применить.")
+            win.destroy()
+
+        def on_reset():
+            txt.delete("1.0", "end")
+            txt.insert("1.0", "\n".join(DEFAULT_SPLIT_DOMAINS))
+
+        ttk.Button(bar, text="Сохранить", style="Accent.TButton", command=on_save).pack(side="left")
+        ttk.Button(bar, text="Сбросить пресет ИИ", command=on_reset).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Отмена", command=win.destroy).pack(side="right")
+
     def _load_config(self):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -2228,6 +2524,12 @@ class App(tk.Tk):
             self.var_verify.set(bool(cfg.get("verify", False)))
             self.var_block_v6_quic.set(bool(cfg.get("block_v6_quic", True)))
             self.var_split_hello.set(bool(cfg.get("split_hello", False)))
+            self.var_split_dns.set(bool(cfg.get("split_dns", False)))
+            if "split_domains" in cfg:
+                self.split_domains = list(parse_split_domains(cfg.get("split_domains", "")))
+            else:
+                self.split_domains = list(DEFAULT_SPLIT_DOMAINS)
+            self.direct_dns_raw = str(cfg.get("direct_dns", "")).strip()
             if cfg.get("sni"):
                 self.ent_sni.delete(0, "end")
                 self.ent_sni.insert(0, cfg["sni"])
@@ -2235,7 +2537,9 @@ class App(tk.Tk):
                 self.ent_doh.delete(0, "end")
                 self.ent_doh.insert(0, cfg["doh_url"])
         except (OSError, json.JSONDecodeError):
-            pass
+            self.split_domains = list(DEFAULT_SPLIT_DOMAINS)
+            self.direct_dns_raw = ""
+        self._update_split_btn_text()
         self._on_proto()
 
     def _save_config(self):
@@ -2248,6 +2552,9 @@ class App(tk.Tk):
                     "verify": self.var_verify.get(),
                     "block_v6_quic": self.var_block_v6_quic.get(),
                     "split_hello": self.var_split_hello.get(),
+                    "split_dns": self.var_split_dns.get(),
+                    "split_domains": "\n".join(self.split_domains),
+                    "direct_dns": self.direct_dns_raw,
                     "sni": self.ent_sni.get().strip(),
                     "doh_url": self.ent_doh.get().strip(),
                 }, f, ensure_ascii=False, indent=2)
@@ -2301,7 +2608,8 @@ class App(tk.Tk):
         if self.proxy:
             v6_txt = " + ::1:53" if self.proxy.ipv6_bound else ""
             blk_txt = " [блок IPv6/QUIC]" if self.proxy.block_v6_quic else ""
-            self.lbl_proxy.config(text=f"Прокси: работает на 127.0.0.1:53{v6_txt}{blk_txt} ✔",
+            split_txt = f" [разд. DNS: {len(self.proxy.split_domains)}]" if self.proxy.split_enabled else ""
+            self.lbl_proxy.config(text=f"Прокси: работает на 127.0.0.1:53{v6_txt}{blk_txt}{split_txt} ✔",
                                   foreground=GREEN)
         else:
             self.lbl_proxy.config(text="Прокси: остановлен", foreground=MUTED)
@@ -2316,6 +2624,24 @@ class App(tk.Tk):
         if not a:
             messagebox.showerror(APP_NAME, "Выберите сетевой адаптер.")
             return
+        split_dns = bool(self.var_split_dns.get())
+        split_domains = list(self.split_domains)
+        direct_dns_raw = self.direct_dns_raw
+        if split_dns and not split_domains:
+            messagebox.showerror(
+                APP_NAME,
+                "Включён «Раздельный DNS», но список доменов пуст.\n"
+                "Нажмите «Домены…» и добавьте домены (или «Сбросить пресет ИИ»).",
+            )
+            return
+        if direct_dns_raw:
+            bad_dir = [ip.strip() for ip in direct_dns_raw.split(",") if ip.strip() and not _valid_ip(ip.strip())]
+            if bad_dir:
+                messagebox.showerror(
+                    APP_NAME,
+                    f"Некорректный прямой DNS в настройках раздельного DNS: {', '.join(bad_dir)}",
+                )
+                return
         built = self._build_upstreams()
         if not built:
             return
@@ -2342,6 +2668,8 @@ class App(tk.Tk):
                     last_err = e
                     self.q.put(("log", f"   ⚠ Апстрим #{idx} не ответил: {e}"))
             if not ok_up:
+                for up in upstreams:
+                    up.close()
                 self.q.put(("log", f"   ✘ Ни один апстрим НЕ отвечает: {last_err}"))
                 self.q.put(("log", "   Проверьте IP, протокол и галочку проверки "
                                    "сертификата. Настройки НЕ применены."))
@@ -2366,14 +2694,28 @@ class App(tk.Tk):
                 old_all = list(old or []) + list(old_v6 or [])
                 self.q.put(("log", f"   Резервная копия DNS: {old_all or 'авто (DHCP)'}"))
 
+            direct_upstreams = []
+            if split_dns:
+                direct_ips, direct_src = resolve_direct_dns(k, pre_old_v4=old, manual_raw=direct_dns_raw)
+                direct_upstreams = [PlainUDPUpstream(ip) for ip in direct_ips]
+                self.q.put(("log", f"   Раздельный DNS: {len(split_domains)} дом. → шифр, "
+                                   f"остальное → {', '.join(direct_ips)} ({direct_src})"))
+
             # 3. Стоп старого прокси, старт нового
             if self.proxy:
                 self.proxy.stop()
                 self.proxy = None
-            proxy = LocalDNSProxy(upstreams, on_log=self._thread_log, block_v6_quic=block_v6_quic)
+            proxy = LocalDNSProxy(
+                upstreams,
+                on_log=self._thread_log,
+                block_v6_quic=block_v6_quic,
+                split_domains=(split_domains if split_dns else None),
+                direct_upstreams=direct_upstreams,
+            )
             try:
                 proxy.start()
             except OSError as e:
+                proxy.stop()
                 self.q.put(("log", f"   ✘ Не удалось занять 127.0.0.1:53 — {e}"))
                 self.q.put(("proxy", None))
                 return
@@ -2382,7 +2724,8 @@ class App(tk.Tk):
             self.q.put(("proxy", None))
             v6_msg = " + ::1:53" if proxy.ipv6_bound else ""
             blk_msg = ", блок IPv6/QUIC: ВКЛ" if block_v6_quic else ""
-            self.q.put(("log", f"   ✔ Локальный прокси слушает 127.0.0.1:53{v6_msg}{blk_msg}"))
+            split_msg = f", раздельный DNS: {len(split_domains)} дом." if proxy.split_enabled else ""
+            self.q.put(("log", f"   ✔ Локальный прокси слушает 127.0.0.1:53{v6_msg}{blk_msg}{split_msg}"))
 
             # 4. Назначаем системный DNS
             target_dns = [LOCAL_DNS, LOCAL_DNS_V6] if (IS_WINDOWS and block_v6_quic and proxy.ipv6_bound) else [LOCAL_DNS]
@@ -2399,8 +2742,10 @@ class App(tk.Tk):
             cur_v6 = get_dns_servers_v6(k)
             assigned = " + ".join(cur_v4 + ([LOCAL_DNS_V6] if cur_v6 == [LOCAL_DNS_V6] else [])) or LOCAL_DNS
             self.q.put(("log", f"   DNS адаптера → {assigned}, кэш очищен."))
-            self.q.put(("log", "✔ Готово! Весь DNS-трафик шифруется. "
-                               "Нажмите «Проверить»."))
+            if proxy.split_enabled:
+                self.q.put(("log", "✔ Готово! Раздельный DNS работает: список ИИ → шифр, остальное → провайдер."))
+            else:
+                self.q.put(("log", "✔ Готово! Весь DNS-трафик шифруется. Нажмите «Проверить»."))
             self.q.put(("status", (a, cur_v4, cur_v6)))
         self._run_async(work)
 
@@ -2470,16 +2815,31 @@ class App(tk.Tk):
             def work():
                 self.q.put(("log", "▶ Проверка…"))
                 try:
-                    q = build_dns_query("example.com")
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                         s.settimeout(8)
-                        s.sendto(q, (LOCAL_DNS, 53))
-                        resp, _ = s.recvfrom(4096)
-                    ips = parse_answers(resp)
-                    self.q.put(("log", f"   127.0.0.1:53 → example.com = "
-                                       f"{', '.join(ips) or 'ответ без A-записей'}"))
-                    self.q.put(("log", "✔ Шифрованный канал работает: запрос ушёл "
-                                       "по TLS на ваш сервер и вернулся с ответом."))
+                        if self.proxy.split_enabled and self.proxy.split_domains:
+                            ai_host = self.proxy.split_domains[0]
+                            s.sendto(build_dns_query(ai_host), (LOCAL_DNS, 53))
+                            r_ai, _ = s.recvfrom(4096)
+                            self.q.put(("log", f"   127.0.0.1:53 → {ai_host} = "
+                                               f"{', '.join(parse_answers(r_ai)) or 'ответ без A-записей'} [SmartDNS ✔]"))
+                            dir_host = ("example.org"
+                                        if match_split_domain("example.com", self.proxy._split_set)
+                                        else "example.com")
+                            s.sendto(build_dns_query(dir_host), (LOCAL_DNS, 53))
+                            r_dir, _ = s.recvfrom(4096)
+                            self.q.put(("log", f"   127.0.0.1:53 → {dir_host} = "
+                                               f"{', '.join(parse_answers(r_dir)) or 'ответ без A-записей'} [Провайдер ✔]"))
+                            self.q.put(("log", "✔ Раздельный DNS работает: список ИИ идёт через шифрованный "
+                                               "сервер, остальное — через провайдера."))
+                        else:
+                            s.sendto(build_dns_query("example.com"), (LOCAL_DNS, 53))
+                            resp, _ = s.recvfrom(4096)
+                            ips = parse_answers(resp)
+                            self.q.put(("log", f"   127.0.0.1:53 → example.com = "
+                                               f"{', '.join(ips) or 'ответ без A-записей'}"))
+                            self.q.put(("log", "✔ Шифрованный канал работает: запрос ушёл "
+                                               "по TLS на ваш сервер и вернулся с ответом."))
                 except Exception as e:  # noqa: BLE001
                     self.q.put(("log", f"   ✘ Прокси не ответил: {e}"))
             self._run_async(work)
@@ -2555,6 +2915,9 @@ class App(tk.Tk):
             "verify": bool(self.var_verify.get()),
             "block_v6_quic": bool(self.var_block_v6_quic.get()),
             "split_hello": bool(self.var_split_hello.get()),
+            "split_dns": bool(self.var_split_dns.get()),
+            "split_domains_count": len(self.split_domains),
+            "direct_dns": self.direct_dns_raw,
             "proxy_running": self.proxy is not None,
             "proxy_stats": self.proxy.get_stats() if self.proxy else None,
         }
@@ -2721,6 +3084,14 @@ def cli_main():
                 return
             upstreams, desc = built
             block_v6_quic = _cli_input("Блокировать IPv6 и QUIC для SmartDNS/ИИ? (y/n)", "y").lower() != "n"
+            split_dns = _cli_input(
+                "Раздельный DNS (только ИИ-домены через сервер, остальное — провайдер)? (y/n)",
+                "n",
+            ).lower() == "y"
+            split_domains = []
+            if split_dns:
+                raw_doms = _cli_input("Домены через запятую (Enter — пресет Gemini/ChatGPT/Claude/и др.)", "")
+                split_domains = list(parse_split_domains(raw_doms)) if raw_doms else list(DEFAULT_SPLIT_DOMAINS)
             print(f"▶ Проверяю апстрим ({desc})…")
             q = build_dns_query("example.com")
             ok_up = False
@@ -2736,6 +3107,8 @@ def cli_main():
                     last_err = e
                     print(f"  ⚠ Апстрим #{idx} не ответил: {e}")
             if not ok_up:
+                for up in upstreams:
+                    up.close()
                 print(f"  ✘ Ни один апстрим НЕ отвечает: {last_err}")
                 print("  Настройки НЕ применены. Проверьте IP, протокол и сертификат.")
                 return
@@ -2754,13 +3127,25 @@ def cli_main():
                 save_backup(key, old, old_v6)
                 old_all = list(old or []) + list(old_v6 or [])
                 print(f"  Резервная копия DNS: {old_all or 'авто (DHCP)'}")
+            direct_upstreams = []
+            if split_dns:
+                direct_ips, direct_src = resolve_direct_dns(key, pre_old_v4=old)
+                direct_upstreams = [PlainUDPUpstream(ip) for ip in direct_ips]
+                print(f"  Раздельный DNS: {len(split_domains)} дом. → шифр, "
+                      f"остальное → {', '.join(direct_ips)} ({direct_src})")
             if proxy:
                 proxy.stop()
                 proxy = None
-            proxy = LocalDNSProxy(upstreams, block_v6_quic=block_v6_quic)
+            proxy = LocalDNSProxy(
+                upstreams,
+                block_v6_quic=block_v6_quic,
+                split_domains=(split_domains if split_dns else None),
+                direct_upstreams=direct_upstreams,
+            )
             try:
                 proxy.start()
             except OSError as e:
+                proxy.stop()
                 print(f"  ✘ Не удалось занять 127.0.0.1:53 — {e}")
                 proxy = None
                 return
@@ -2774,7 +3159,8 @@ def cli_main():
                 active = None
                 return
             flush_dns_cache()
-            print(f"✔ Шифрованный DNS включён на «{a['name']}». Весь DNS идёт через TLS.")
+            print(f"✔ Шифрованный DNS включён на «{a['name']}»."
+                  + (" Режим: раздельный DNS." if proxy.split_enabled else " Весь DNS идёт через TLS."))
 
         def disable():
             nonlocal proxy, active
@@ -2807,10 +3193,24 @@ def cli_main():
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                         s.settimeout(8)
-                        s.sendto(build_dns_query("example.com"), (LOCAL_DNS, 53))
-                        resp, _ = s.recvfrom(4096)
-                    print(f"  ✔ 127.0.0.1:53 → example.com = "
-                          f"{', '.join(parse_answers(resp)) or 'ответ без A-записей'}")
+                        if proxy.split_enabled and proxy.split_domains:
+                            ai_host = proxy.split_domains[0]
+                            s.sendto(build_dns_query(ai_host), (LOCAL_DNS, 53))
+                            r_ai, _ = s.recvfrom(4096)
+                            print(f"  ✔ 127.0.0.1:53 → {ai_host} = "
+                                  f"{', '.join(parse_answers(r_ai)) or 'ответ без A-записей'} [SmartDNS]")
+                            dir_host = ("example.org"
+                                        if match_split_domain("example.com", proxy._split_set)
+                                        else "example.com")
+                            s.sendto(build_dns_query(dir_host), (LOCAL_DNS, 53))
+                            r_dir, _ = s.recvfrom(4096)
+                            print(f"  ✔ 127.0.0.1:53 → {dir_host} = "
+                                  f"{', '.join(parse_answers(r_dir)) or 'ответ без A-записей'} [Провайдер]")
+                        else:
+                            s.sendto(build_dns_query("example.com"), (LOCAL_DNS, 53))
+                            resp, _ = s.recvfrom(4096)
+                            print(f"  ✔ 127.0.0.1:53 → example.com = "
+                                  f"{', '.join(parse_answers(resp)) or 'ответ без A-записей'}")
                 except Exception as e:  # noqa: BLE001
                     print(f"  ✘ Прокси не ответил: {e}")
             else:
