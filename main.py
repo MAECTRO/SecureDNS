@@ -21,6 +21,7 @@ import concurrent.futures
 import ctypes
 import datetime
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -41,7 +42,7 @@ from tkinter import ttk, messagebox, filedialog
 import traceback
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -786,30 +787,205 @@ def make_ssl_context(verify: bool, server_hostname: str | None):
     return ctx
 
 
-class DoTUpstream:
-    """DNS-over-TLS (RFC 7858): TLS-соединение на порт 853, кадрирование 2 байта длины."""
+class _SplitTLSRawIO(io.RawIOBase):
+    """Адаптер потока для http.client.HTTPResponse.makefile('rb') поверх SplitTLSSocket."""
 
-    def __init__(self, ip: str, port: int = 853, verify: bool = False,
-                 hostname: str | None = None, timeout: float = 6.0):
-        self.ip, self.port, self.timeout = ip, port, timeout
-        self.hostname = hostname
-        self.verify = verify
-        self._ctx = make_ssl_context(verify, hostname)
-        self._sock = None
-        self._lock = threading.Lock()
+    def __init__(self, wrapper):
+        self._w = wrapper
 
-    def _connect(self):
-        raw = socket.create_connection((self.ip, self.port), timeout=self.timeout)
-        try:
-            raw.settimeout(self.timeout)
-            sni = self.hostname or (self.ip if self.verify else None)
-            return self._ctx.wrap_socket(raw, server_hostname=sni)
-        except Exception:
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        data = self._w.recv(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+
+class SplitTLSSocket:
+    """Обёртка над SSLObject+MemoryBIO, дробящая первый пакет TLS ClientHello (по умолчанию 3 байта + остаток)."""
+
+    def __init__(self, sock: socket.socket, ssl_obj: ssl.SSLObject,
+                 in_bio: ssl.MemoryBIO, out_bio: ssl.MemoryBIO,
+                 split_bytes: int = 3, split_delay: float = 0.015):
+        self._sock = sock
+        self._ssl = ssl_obj
+        self._in = in_bio
+        self._out = out_bio
+        self._split_bytes = split_bytes
+        self._split_delay = split_delay
+        self._first_flight = True
+
+    def _flush_out(self):
+        data = self._out.read()
+        if not data:
+            return
+        if self._first_flight and self._split_bytes > 0 and len(data) > self._split_bytes:
+            self._first_flight = False
             try:
-                raw.close()
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+            self._sock.sendall(data[:self._split_bytes])
+            if self._split_delay > 0:
+                time.sleep(self._split_delay)
+            self._sock.sendall(data[self._split_bytes:])
+        else:
+            self._first_flight = False
+            self._sock.sendall(data)
+
+    def _feed_in(self):
+        chunk = self._sock.recv(16384)
+        if not chunk:
+            raise ConnectionError("соединение закрыто во время TLS-рукопожатия")
+        self._in.write(chunk)
+
+    def do_handshake(self):
+        while True:
+            try:
+                self._ssl.do_handshake()
+                self._flush_out()
+                return
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._feed_in()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+
+    def send(self, data):
+        while True:
+            try:
+                n = self._ssl.write(data)
+                self._flush_out()
+                return n
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._feed_in()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+
+    def sendall(self, data):
+        view = memoryview(data)
+        sent = 0
+        while sent < len(view):
+            try:
+                n = self._ssl.write(view[sent:])
+                self._flush_out()
+                sent += n
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._feed_in()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+
+    def recv(self, bufsize: int = 4096) -> bytes:
+        while True:
+            try:
+                self._flush_out()
+                return self._ssl.read(bufsize)
+            except ssl.SSLWantReadError:
+                chunk = self._sock.recv(max(4096, bufsize))
+                if not chunk:
+                    return b""
+                self._in.write(chunk)
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+            except ssl.SSLZeroReturnError:
+                return b""
+
+    def makefile(self, mode: str = "r", buffering=None):
+        raw = _SplitTLSRawIO(self)
+        if buffering == 0:
+            return raw
+        return io.BufferedReader(raw, buffer_size=buffering or 8192)
+
+    def settimeout(self, timeout):
+        self._sock.settimeout(timeout)
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def _connect_tls_once(ip: str, port: int, ctx: ssl.SSLContext, server_hostname: str | None,
+                      connect_timeout: float, io_timeout: float, use_split: bool = False):
+    raw = socket.create_connection((ip, port), timeout=connect_timeout)
+    try:
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        raw.settimeout(connect_timeout)
+        if use_split:
+            in_bio = ssl.MemoryBIO()
+            out_bio = ssl.MemoryBIO()
+            ssl_obj = ctx.wrap_bio(in_bio, out_bio, server_hostname=server_hostname)
+            sock = SplitTLSSocket(raw, ssl_obj, in_bio, out_bio, split_bytes=3, split_delay=0.015)
+            sock.do_handshake()
+        else:
+            sock = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        sock.settimeout(io_timeout)
+        return sock
+    except Exception:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        raise
+
+
+def _connect_tls_smart(ip: str, port: int, ctx: ssl.SSLContext, server_hostname: str | None,
+                       connect_timeout: float, io_timeout: float, split_hello: bool = False):
+    """Открывает TLS-сокет с быстрым ретраем при потерях и фоллбэком на резку ClientHello для :443."""
+    if port == 443:
+        attempts = [True, True, False] if split_hello else [False, False, True]
+    else:
+        attempts = [True, True] if split_hello else [False, False]
+
+    last_err = None
+    for use_split in attempts:
+        try:
+            return _connect_tls_once(
+                ip, port, ctx, server_hostname,
+                connect_timeout=connect_timeout, io_timeout=io_timeout, use_split=use_split,
+            )
+        except ssl.SSLCertVerificationError:
             raise
+        except ConnectionRefusedError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise last_err
+
+
+class DoTUpstream:
+    """DNS-over-TLS (RFC 7858): пул TLS-соединений на порт 853, кадрирование 2 байта длины."""
+
+    def __init__(self, ip: str, port: int = 853, verify: bool = False,
+                 hostname: str | None = None, timeout: float = 6.0,
+                 split_hello: bool = False, connect_timeout: float = 2.0):
+        self.ip, self.port, self.timeout = ip, port, timeout
+        self.connect_timeout = min(float(connect_timeout), float(timeout))
+        self.hostname = hostname
+        self.verify = verify
+        self.split_hello = bool(split_hello)
+        self._ctx = make_ssl_context(verify, hostname)
+        self._pool = queue.LifoQueue(maxsize=4)
+        self._closed = False
+
+    def _connect(self):
+        sni = self.hostname or (self.ip if self.verify else None)
+        return _connect_tls_smart(
+            self.ip, self.port, self._ctx, sni,
+            connect_timeout=self.connect_timeout, io_timeout=self.timeout,
+            split_hello=self.split_hello,
+        )
 
     @staticmethod
     def _recv_exact(s, n):
@@ -821,53 +997,89 @@ class DoTUpstream:
             buf += chunk
         return buf
 
-    def query(self, packet: bytes) -> bytes:
-        with self._lock:
-            last_err = None
-            for _ in range(2):  # одна попытка переподключения
-                try:
-                    if self._sock is None:
-                        self._sock = self._connect()
-                    s = self._sock
-                    s.sendall(struct.pack("!H", len(packet)) + packet)
-                    ln = struct.unpack("!H", self._recv_exact(s, 2))[0]
-                    if ln < 2:
-                        raise IOError("некорректная длина DNS-ответа")
-                    resp = self._recv_exact(s, ln)
-                    if len(packet) >= 2 and resp[:2] != packet[:2]:
-                        raise IOError("несовпадение Transaction ID")
-                    return resp
-                except Exception as e:  # noqa: BLE001
-                    last_err = e
-                    if self._sock is not None:
-                        try:
-                            self._sock.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        self._sock = None
-            raise IOError(f"DoT {self.ip}: {last_err}")
+    def _roundtrip(self, s, packet: bytes) -> bytes:
+        s.settimeout(self.timeout)
+        s.sendall(struct.pack("!H", len(packet)) + packet)
+        ln = struct.unpack("!H", self._recv_exact(s, 2))[0]
+        if ln < 2:
+            raise IOError("некорректная длина DNS-ответа")
+        resp = self._recv_exact(s, ln)
+        if len(packet) >= 2 and resp[:2] != packet[:2]:
+            raise IOError("несовпадение Transaction ID")
+        return resp
 
-    def close(self):
-        if self._sock is not None:
+    def _put_sock(self, s):
+        if self._closed:
             try:
-                self._sock.close()
+                s.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._sock = None
+            return
+        try:
+            self._pool.put_nowait(s)
+        except queue.Full:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def query(self, packet: bytes) -> bytes:
+        # 1. Пробуем переиспользовать сокеты из пула (до 2 попыток на случай протухшего)
+        for _ in range(2):
+            try:
+                s = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                resp = self._roundtrip(s, packet)
+                self._put_sock(s)
+                return resp
+            except Exception:  # noqa: BLE001
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # 2. Открываем свежее TLS-соединение (с быстрым ретраем в _connect_tls_smart)
+        s = None
+        try:
+            s = self._connect()
+            resp = self._roundtrip(s, packet)
+            self._put_sock(s)
+            return resp
+        except Exception as e:  # noqa: BLE001
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise IOError(f"DoT {self.ip}: {e}")
+
+    def close(self):
+        self._closed = True
+        while True:
+            try:
+                s = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class DoHUpstream:
-    """DNS-over-HTTPS (RFC 8484): POST application/dns-message на указанный URL.
+    """DNS-over-HTTPS (RFC 8484): пул Keep-Alive соединений POST application/dns-message.
 
-    Решает «проблему курицы и яйца»: после переключения системного DNS на
-    локальный прокси резолвить имя DoH-сервера уже некому. Поэтому коннектимся
-    на заранее известный IP (bootstrap_ip/bootstrap_ips или зарезолвленный до переключения),
-    а домен отправляем в TLS SNI и HTTP-заголовке Host — nginx поймёт маршрут.
+    Решает «проблему курицы и яйца»: коннектимся напрямую на bootstrap IP
+    (или зарезолвленный до переключения DNS), переиспользуем открытый TLS-сокет
+    по HTTP/1.1 Keep-Alive и быстро ретраим рукопожатие при потерях пакетов на :443.
     """
 
     def __init__(self, url: str, verify: bool = True,
                  bootstrap_ip: str | None = None, timeout: float = 6.0,
-                 bootstrap_ips: list[str] | None = None):
+                 bootstrap_ips: list[str] | None = None,
+                 split_hello: bool = False, connect_timeout: float = 2.0):
         from urllib.parse import urlparse
         u = urlparse(url)
         if not u.hostname:
@@ -878,12 +1090,16 @@ class DoHUpstream:
         if u.query:
             self.path += "?" + u.query
         self.timeout = timeout
+        self.connect_timeout = min(float(connect_timeout), float(timeout))
+        self.split_hello = bool(split_hello)
         self._ctx = make_ssl_context(verify, self.host)
         ips = [ip for ip in (bootstrap_ips or []) if ip]
         if not ips and bootstrap_ip:
             ips = [bootstrap_ip]
         self._explicit_ips = bool(ips)
         self._ips = list(dict.fromkeys(ips))
+        self._pool = queue.LifoQueue(maxsize=4)
+        self._closed = False
         if not self._ips:
             self._resolve()
 
@@ -896,6 +1112,58 @@ class DoHUpstream:
                 self._ips = ips
         except OSError:
             pass  # оставляем прежние адреса
+
+    def _pop_conn(self, ip: str):
+        requeue = []
+        found = None
+        while True:
+            try:
+                item_ip, conn = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            if found is None and item_ip == ip:
+                found = conn
+                break
+            requeue.append((item_ip, conn))
+        for item in requeue:
+            try:
+                self._pool.put_nowait(item)
+            except queue.Full:
+                try:
+                    item[1].close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return found
+
+    def _push_conn(self, ip: str, conn):
+        if self._closed:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            self._pool.put_nowait((ip, conn))
+        except queue.Full:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _send_over_conn(self, conn: http.client.HTTPSConnection, packet: bytes) -> tuple[bytes, bool, int]:
+        host_hdr = self.host if self.port == 443 else f"{self.host}:{self.port}"
+        if conn.sock is not None:
+            conn.sock.settimeout(self.timeout)
+        conn.request("POST", self.path, body=packet, headers={
+            "Host": host_hdr,
+            "Content-Type": "application/dns-message",
+            "Accept": "application/dns-message",
+            "Connection": "keep-alive",
+        })
+        resp = conn.getresponse()
+        body = resp.read()
+        keep = (not resp.will_close) and (not self._closed)
+        return body, keep, resp.status
 
     def query(self, packet: bytes) -> bytes:
         if not self._ips and not self._explicit_ips:
@@ -912,35 +1180,67 @@ class DoHUpstream:
         raise IOError(f"DoH {self.host}: {last}")
 
     def _query_via(self, ip: str, packet: bytes) -> bytes:
-        raw = socket.create_connection((ip, self.port), timeout=self.timeout)
-        try:
-            raw.settimeout(self.timeout)
-            sock = self._ctx.wrap_socket(raw, server_hostname=self.host)
-        except Exception:
+        # 1. Пробуем живой Keep-Alive коннект из пула
+        for _ in range(2):
+            conn = self._pop_conn(ip)
+            if conn is None:
+                break
             try:
-                raw.close()
-            except OSError:
-                pass
-            raise
-        # HTTPSConnection с готовым TLS-сокетом: Host без лишнего :443
+                body, keep, status = self._send_over_conn(conn, packet)
+            except Exception:  # noqa: BLE001
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            if status != 200:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise IOError(f"DoH {self.host}: HTTP {status}")
+            if keep:
+                self._push_conn(ip, conn)
+            else:
+                conn.close()
+            return body
+
+        # 2. Открываем новое TLS-соединение (с быстрым ретраем и фоллбэком резки для :443)
+        sock = _connect_tls_smart(
+            ip, self.port, self._ctx, self.host,
+            connect_timeout=self.connect_timeout, io_timeout=self.timeout,
+            split_hello=self.split_hello,
+        )
         conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout)
         conn.sock = sock
-        host_hdr = self.host if self.port == 443 else f"{self.host}:{self.port}"
         try:
-            conn.request("POST", self.path, body=packet, headers={
-                "Host": host_hdr,
-                "Content-Type": "application/dns-message",
-                "Accept": "application/dns-message",
-            })
-            resp = conn.getresponse()
-            if resp.status != 200:
-                raise IOError(f"DoH {self.host}: HTTP {resp.status}")
-            return resp.read()
-        finally:
-            conn.close()
+            body, keep, status = self._send_over_conn(conn, packet)
+            if status != 200:
+                conn.close()
+                raise IOError(f"DoH {self.host}: HTTP {status}")
+            if keep:
+                self._push_conn(ip, conn)
+            else:
+                conn.close()
+            return body
+        except Exception:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
     def close(self):
-        pass
+        self._closed = True
+        while True:
+            try:
+                _, conn = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1403,6 +1703,7 @@ def collect_diagnostics(app_state: dict | None = None, ui_log_text: str = "") ->
             f"DoH URL: {app_state.get('doh_url', '')!r}",
             f"Verify TLS: {app_state.get('verify')}",
             f"Block IPv6/QUIC: {app_state.get('block_v6_quic')}",
+            f"Split TLS ClientHello: {app_state.get('split_hello')}",
             f"Proxy Running: {proxy_running}",
         ])
     else:
@@ -1529,8 +1830,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION} — шифрованный DNS (DoT/DoH)")
-        self.geometry("700x725")
-        self.minsize(660, 680)
+        self.geometry("700x755")
+        self.minsize(660, 710)
         self.configure(bg=BG)
         if IS_WINDOWS:
             try:
@@ -1660,10 +1961,10 @@ class App(tk.Tk):
         row.pack(fill="x", padx=16, pady=(10, 0))
         ttk.Label(row, text="Протокол шифрования:").pack(anchor="w")
         self.var_proto = tk.StringVar(value="dot")
-        ttk.Radiobutton(row, text="DoT — DNS-over-TLS, порт 853",
+        ttk.Radiobutton(row, text="DoT — DNS-over-TLS, порт 853 (рекомендуется для РФ — без потерь :443)",
                         variable=self.var_proto, value="dot",
                         command=self._on_proto).pack(anchor="w", pady=(4, 0))
-        ttk.Radiobutton(row, text="DoH — DNS-over-HTTPS, порт 443 (нужен URL шаблона)",
+        ttk.Radiobutton(row, text="DoH — DNS-over-HTTPS, порт 443 или :8443 в URL (при сбое :443 в РФ укажите :8443)",
                         variable=self.var_proto, value="doh",
                         command=self._on_proto).pack(anchor="w")
         self.ent_doh = ttk.Entry(row)
@@ -1687,6 +1988,11 @@ class App(tk.Tk):
         self.var_block_v6_quic = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Блокировать IPv6 и QUIC (рекомендуется для SmartDNS / ИИ)",
                         variable=self.var_block_v6_quic).pack(anchor="w", pady=(2, 0))
+
+        # Фрагментация ClientHello на 3 байта при ТСПУ-блокировках :443
+        self.var_split_hello = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Резать TLS ClientHello по 3 байта (обход ТСПУ для :443; иначе сработает как фоллбэк)",
+                        variable=self.var_split_hello).pack(anchor="w", pady=(2, 0))
 
         # Кнопки
         btns = ttk.Frame(self)
@@ -1792,8 +2098,8 @@ class App(tk.Tk):
             self.lbl_ips.config(text="IP DoH-сервера (рекомендуется — прямое подключение "
                                      "без DNS-резолва):")
             self.lbl_ips_hint.config(
-                text="Домен из URL пойдёт в SNI/Host, коннект — напрямую на эти IP. "
-                     "Если оставить пустым, домен резолвится заранее.")
+                text="Каждый IP балансируется отдельно (Keep-Alive). В РФ при потерях :443 "
+                     "допишите порт: https://домен:8443/dns-query")
         else:
             self.ent_doh.pack_forget()
             self.frm_sni.pack(fill="x", pady=(4, 0))
@@ -1883,6 +2189,8 @@ class App(tk.Tk):
                                            "например: 9.9.9.9, 149.112.112.112")
             return None
         verify = self.var_verify.get()
+        split_hello = self.var_split_hello.get()
+        split_tag = " + TLS-резка 3B" if split_hello else ""
         if self.var_proto.get() == "dot":
             if not ips:
                 messagebox.showerror(APP_NAME, "Для DoT впишите хотя бы один IP сервера.")
@@ -1896,14 +2204,16 @@ class App(tk.Tk):
                         "проверка, скорее всего, не пройдёт (IP address mismatch).\n\n"
                         "Продолжить без домена?"):
                     return None
-            return [DoTUpstream(ip, 853, verify=verify, hostname=sni) for ip in ips], \
-                   f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "")
+            return [DoTUpstream(ip, 853, verify=verify, hostname=sni, split_hello=split_hello) for ip in ips], \
+                   f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "") + split_tag
         url = self.ent_doh.get().strip()
         if not url.startswith("https://"):
             messagebox.showerror(APP_NAME, "DoH-шаблон должен начинаться с https://")
             return None
-        desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else "")
-        return [DoHUpstream(url, verify=verify, bootstrap_ips=ips)], desc
+        desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else "") + split_tag
+        if ips:
+            return [DoHUpstream(url, verify=verify, bootstrap_ips=[ip], split_hello=split_hello) for ip in ips], desc
+        return [DoHUpstream(url, verify=verify, bootstrap_ips=[], split_hello=split_hello)], desc
 
     # ---------- конфиг ----------
     def _load_config(self):
@@ -1917,6 +2227,7 @@ class App(tk.Tk):
             self.var_proto.set(cfg.get("proto", "dot"))
             self.var_verify.set(bool(cfg.get("verify", False)))
             self.var_block_v6_quic.set(bool(cfg.get("block_v6_quic", True)))
+            self.var_split_hello.set(bool(cfg.get("split_hello", False)))
             if cfg.get("sni"):
                 self.ent_sni.delete(0, "end")
                 self.ent_sni.insert(0, cfg["sni"])
@@ -1936,6 +2247,7 @@ class App(tk.Tk):
                     "proto": self.var_proto.get(),
                     "verify": self.var_verify.get(),
                     "block_v6_quic": self.var_block_v6_quic.get(),
+                    "split_hello": self.var_split_hello.get(),
                     "sni": self.ent_sni.get().strip(),
                     "doh_url": self.ent_doh.get().strip(),
                 }, f, ensure_ascii=False, indent=2)
@@ -2184,21 +2496,25 @@ class App(tk.Tk):
             ok_any = False
             last_err = None
             q = build_dns_query("example.com")
-            for idx, up in enumerate(upstreams, 1):
-                try:
-                    resp = up.query(q)
-                    ips = parse_answers(resp)
-                    self.q.put(("log", f"   ✔ Апстрим #{idx} отвечает: example.com → "
-                                       f"{', '.join(ips) or 'ответ получен'}"))
-                    ok_any = True
-                    break
-                except Exception as e:  # noqa: BLE001
-                    last_err = e
-                    self.q.put(("log", f"   ⚠ Апстрим #{idx} не ответил: {e}"))
-            if ok_any:
-                self.q.put(("log", "   Сервер рабочий — можно нажимать «Включить»."))
-            else:
-                self.q.put(("log", f"   ✘ Ни один апстрим не отвечает: {last_err}"))
+            try:
+                for idx, up in enumerate(upstreams, 1):
+                    try:
+                        resp = up.query(q)
+                        ips = parse_answers(resp)
+                        self.q.put(("log", f"   ✔ Апстрим #{idx} отвечает: example.com → "
+                                           f"{', '.join(ips) or 'ответ получен'}"))
+                        ok_any = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_err = e
+                        self.q.put(("log", f"   ⚠ Апстрим #{idx} не ответил: {e}"))
+                if ok_any:
+                    self.q.put(("log", "   Сервер рабочий — можно нажимать «Включить»."))
+                else:
+                    self.q.put(("log", f"   ✘ Ни один апстрим не отвечает: {last_err}"))
+            finally:
+                for up in upstreams:
+                    up.close()
         self._run_async(work_upstream)
 
     def _on_log_saved(self, path: str):
@@ -2238,6 +2554,7 @@ class App(tk.Tk):
             "doh_url": self.ent_doh.get().strip(),
             "verify": bool(self.var_verify.get()),
             "block_v6_quic": bool(self.var_block_v6_quic.get()),
+            "split_hello": bool(self.var_split_hello.get()),
             "proxy_running": self.proxy is not None,
             "proxy_stats": self.proxy.get_stats() if self.proxy else None,
         }
@@ -2307,30 +2624,34 @@ def _cli_build_upstreams():
         print(f"✘ Некорректные адреса: {', '.join(bad) or raw}. "
               f"Пример: 9.9.9.9, 149.112.112.112")
     while True:
-        proto = _cli_input("Протокол: dot (порт 853) или doh (порт 443)", "dot").lower()
+        proto = _cli_input("Протокол: dot (порт 853, рекомендуется для РФ) или doh (443/:8443)", "dot").lower()
         if proto in ("dot", "doh"):
             break
         print("✘ Впишите буквально «dot» или «doh». "
               "Домен сюда вписывать не надо — он спросится дальше.")
     verify = _cli_input("Проверять TLS-сертификат сервера? (y/n)", "n").lower() == "y"
+    split_hello = _cli_input("Резать TLS ClientHello по 3 байта принудительно (обход ТСПУ для :443)? (y/n)", "n").lower() == "y"
+    split_tag = " + TLS-резка 3B" if split_hello else ""
     if proto == "dot":
         sni = None
         if verify:
             raw_sni = _cli_input("Домен сертификата для проверки (сертификат обычно "
                                  "выпущен на домен, а не на IP; пусто — проверять по IP)")
             sni = _clean_sni_host(raw_sni)
-        return [DoTUpstream(ip, 853, verify=verify, hostname=sni) for ip in ips], \
-               f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "")
+        return [DoTUpstream(ip, 853, verify=verify, hostname=sni, split_hello=split_hello) for ip in ips], \
+               f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "") + split_tag
     while True:
-        url = _cli_input("DoH-шаблон (https://..., пусто — отмена)")
+        url = _cli_input("DoH-шаблон (https://... или https://домен:8443/dns-query, пусто — отмена)")
         if not url:
             return None
         if url.startswith("https://"):
             break
         print("✘ Шаблон должен начинаться с https://")
-    desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else "")
+    desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else "") + split_tag
     try:
-        return [DoHUpstream(url, verify=verify, bootstrap_ips=ips)], desc
+        if ips:
+            return [DoHUpstream(url, verify=verify, bootstrap_ips=[ip], split_hello=split_hello) for ip in ips], desc
+        return [DoHUpstream(url, verify=verify, bootstrap_ips=[], split_hello=split_hello)], desc
     except ValueError as e:
         print(f"✘ {e}")
         return None
