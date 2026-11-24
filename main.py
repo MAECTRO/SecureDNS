@@ -48,7 +48,7 @@ except ImportError:
     winreg = None
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.5.1"
+APP_VERSION = "1.3.5.2"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -2752,6 +2752,62 @@ def import_config_link(raw: str) -> dict:
     }
 
 
+BEGINNER_GUIDE_SECTIONS = (
+    (
+        "Шаг 1. Подготовка и выбор адаптера",
+        (
+            "1. Запустите от администратора (вверху справа должно гореть «права ✓»; на Linux — ./securedns.sh).",
+            "2. В списке «Сетевой адаптер» выберите сеть, через которую сейчас есть интернет (Wi-Fi или Ethernet).",
+        ),
+    ),
+    (
+        "Шаг 2. Как ввести настройки (выберите один вариант)",
+        (
+            "• Вариант А — вам скинули строку securedns://v1/...:\n"
+            "  Скопируйте её и нажмите кнопку «Вставить конфиг» в правом верхнем углу. Всё заполнится само.",
+            "• Вариант Б — есть только ссылка https://.../dns-query:\n"
+            "  Выберите «DoH (как в Chrome)», вставьте ссылку в поле URL и оставьте галочку «Проверять TLS-сертификат».",
+            "• Вариант В — дали только IP-адреса (один или через запятую):\n"
+            "  Оставьте «DoT — порт 853 по IP» и впишите IP. Если домен не дали — снимите «Проверять TLS-сертификат».\n"
+            "  Если вместе с IP дали домен — впишите его в «Домен сертификата SNI» и оставьте проверку сертификата.",
+            "• Вариант Г — есть и ссылка https://..., и IP-адрес:\n"
+            "  Выберите «DoH по своим IP» и заполните оба поля. Если провайдер режет порт 443, допишите :8443:\n"
+            "  https://ваш-домен:8443/dns-query",
+        ),
+    ),
+    (
+        "Шаг 3. Какие галочки нужны",
+        (
+            "• «Блокировать IPv6 и QUIC (AAAA/SVCB)» — держите включённой, чтобы браузер не шёл в обход.",
+            "• «Раздельный DNS» — включайте, если нужны только нейросети (список «Домены…»), а обычные сайты,\n"
+            "  банки и игры должны идти напрямую от вашего провайдера.",
+            "• «Сворачивать в трей при закрытии» и «Автозапуск с Windows» — по желанию для фоновой работы.",
+            "• «Резать ClientHello по 3 байта (:443)» и «Блок UDP:443 QUIC в Firewall» — включайте только если\n"
+            "  без них сайты не открываются или соединение обрывается по таймауту.",
+            "• Кнопка «Откл. DoH Chrome/Edge» вверху — нажмите, если в строке «Браузеры (DoH)» написано,\n"
+            "  что в браузере включён собственный защищённый DNS.",
+        ),
+    ),
+    (
+        "Шаг 4. Включение, проверка и что делать при сбое",
+        (
+            "1. Нажмите синюю кнопку «Включить шифрованный DNS», дождитесь зелёной строки и нажмите «Проверить».\n"
+            "   Надпись «✔ Шифрованный канал работает» значит, что всё настроено правильно.",
+            "2. Пока защита работает, полностью выходить из программы не нужно — пусть висит в трее.\n"
+            "   Перед выключением сначала нажмите «Отключить», чтобы вернуть обычный DNS.",
+            "3. Если при старте пишет timed out — нажмите «Тест портов». Программа сразу проверит :853,\n"
+            "   цельный :443, :443 с резкой 3B и :8443 и покажет галочкой рабочий вариант у вашего провайдера.",
+            "4. Если всё равно нужна помощь — нажмите «Сохранить лог (.txt)» над журналом и отправьте файл.",
+        ),
+    ),
+)
+
+
+def format_beginner_guide() -> str:
+    """Форматирует пошаговую инструкцию для встроенной справки GUI, CLI и буфера обмена."""
+    return "\n\n".join(title + "\n" + "\n".join(items) for title, items in BEGINNER_GUIDE_SECTIONS)
+
+
 def default_log_export_dir() -> str:
     """Папка по умолчанию для сохранения диагностического .txt отчёта."""
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -2969,7 +3025,9 @@ class App(tk.Tk):
         self._update_info = None
         self._browser_doh_info = {}
         self._tray = None
+        self._help_win = None
         self.btn_update = None
+        self.btn_help = None
         self.btn_save_log = None
         self.btn_split_edit = None
         self.btn_probe = None
@@ -3074,6 +3132,10 @@ class App(tk.Tk):
             header, text="Копировать конфиг", style="Small.TButton", command=self.on_copy_config
         )
         self.btn_copy_cfg.pack(side="right", padx=(0, 6))
+        self.btn_help = ttk.Button(
+            header, text="? Инструкция", style="Small.TButton", command=self.on_show_help
+        )
+        self.btn_help.pack(side="right", padx=(0, 6))
 
         if not is_admin():
             tk.Label(self, text="Нет прав администратора: закройте программу и "
@@ -3259,7 +3321,7 @@ class App(tk.Tk):
         self.txt_log.pack(fill="both", expand=True, padx=16, pady=(0, 12))
 
         self.log(f"{APP_NAME} {APP_VERSION}. Выберите режим (DoT по IP или чистый DoH по ссылке) "
-                 f"и нажмите «Включить». В локальном прокси работают кэш TTL и Keep-Alive.")
+                 f"и нажмите «Включить» (памятка: «? Инструкция» вверху).")
 
     # ---------- утилиты UI ----------
     def log(self, msg: str):
@@ -3583,6 +3645,69 @@ class App(tk.Tk):
         bar.pack(fill="x", padx=14, pady=(0, 12))
         ttk.Button(bar, text="Применить", style="Accent.TButton", command=apply_paste).pack(side="left")
         ttk.Button(bar, text="Отмена", command=win.destroy).pack(side="right")
+
+    def on_show_help(self):
+        if self._help_win is not None:
+            try:
+                if self._help_win.winfo_exists():
+                    self._help_win.deiconify()
+                    self._help_win.lift()
+                    self._help_win.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self._help_win = None
+
+        win = tk.Toplevel(self)
+        self._help_win = win
+        win.title(f"{APP_NAME} {APP_VERSION} — инструкция для новичков")
+        win.geometry("670x580")
+        win.minsize(540, 420)
+        win.configure(bg=BG)
+        win.transient(self)
+        if IS_WINDOWS and self._ico_path and os.path.exists(self._ico_path):
+            try:
+                win.iconbitmap(self._ico_path)
+            except Exception:  # noqa: BLE001
+                pass
+
+        ttk.Label(
+            win,
+            text="Как настроить SecureDNS за 1 минуту",
+            font=("Segoe UI Semibold", 11),
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        scroll = ttk.Scrollbar(body, orient="vertical")
+        scroll.pack(side="right", fill="y")
+        txt = tk.Text(
+            body, bg="#12141a", fg=FG, font=("Segoe UI", 9),
+            wrap="word", relief="flat", padx=10, pady=8, yscrollcommand=scroll.set,
+        )
+        txt.pack(side="left", fill="both", expand=True)
+        scroll.configure(command=txt.yview)
+        txt.tag_configure("heading", font=("Segoe UI Semibold", 10), foreground=ACCENT)
+
+        for idx, (title, items) in enumerate(BEGINNER_GUIDE_SECTIONS):
+            if idx:
+                txt.insert("end", "\n\n")
+            txt.insert("end", title + "\n", "heading")
+            txt.insert("end", "\n".join(items))
+        txt.configure(state="disabled")
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        def copy_guide():
+            self.clipboard_clear()
+            self.clipboard_append(format_beginner_guide())
+            self.update_idletasks()
+            self.log("✔ Инструкция скопирована в буфер обмена.")
+
+        ttk.Button(bar, text="Скопировать инструкцию", command=copy_guide).pack(side="left")
+        ttk.Button(bar, text="Закрыть", style="Accent.TButton", command=win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     # ---------- автообновление ----------
     def _check_update_bg(self):
@@ -4616,7 +4741,7 @@ def cli_main():
 
         try:
             while True:
-                print("\n  1) Статус   2) Включить   3) Отключить   4) Проверить   5) Тест портов   6) Сохранить лог (.txt)   7) Выход")
+                print("\n  1) Статус   2) Включить   3) Отключить   4) Проверить   5) Тест портов   6) Сохранить лог (.txt)   7) Инструкция   8) Выход")
                 cmd = _cli_input("Выбор")
                 if cmd == "1":
                     show_status()
@@ -4630,7 +4755,9 @@ def cli_main():
                     probe_ports()
                 elif cmd == "6":
                     save_log()
-                elif cmd in ("7", "q", "й"):
+                elif cmd in ("7", "?", "h", "H"):
+                    print("\n" + format_beginner_guide() + "\n")
+                elif cmd in ("8", "q", "й"):
                     break
                 elif cmd == "":
                     continue
