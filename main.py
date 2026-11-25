@@ -48,7 +48,7 @@ except ImportError:
     winreg = None
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.6.1"
 DEFAULT_DOH_PLACEHOLDER = "https://example.com/dns-query"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
@@ -1874,10 +1874,10 @@ def resolve_bootstrap_ips(host: str, direct_dns_ips: list[str] | None = None) ->
     except ValueError:
         pass
 
-    # 1. Прямой UDP A-запрос к провайдерским/публичным серверам (не зависит от того, задан ли 127.0.0.1)
+    # 1. Прямой UDP A-запрос к DNS адаптера/бэкапа (не зависит от того, задан ли 127.0.0.1)
     q = build_dns_query(h, qtype=1)
     candidates = []
-    for ip in list(direct_dns_ips or []) + ["77.88.8.8", "1.1.1.1", "8.8.8.8"]:
+    for ip in list(direct_dns_ips or []):
         if _valid_ip(ip) and ip not in candidates:
             candidates.append(ip)
     for dns_ip in candidates:
@@ -3411,7 +3411,7 @@ def _install_clipboard_support(root: tk.Tk):
         return "break"
 
     def on_ctrl_key(event):
-        if (event.state & 0x20000) or (event.state & 0x8):
+        if event.state & (0x20000 if IS_WINDOWS else 0x8):
             return
         act = (_VK_TO_CLIP_ACT.get(event.keycode) if IS_WINDOWS else None) or _KEYSYM_TO_CLIP_ACT.get(
             str(event.keysym or "").lower()
@@ -3696,7 +3696,7 @@ class App(tk.Tk):
         self.ent_doh.pack(fill="x", pady=(2, 0))
         self.lbl_doh_hint = ttk.Label(
             self.frm_doh,
-            text="Например: https://dns.example.com/dns-query",
+            text="Укажите ваш DoH URL формата https://ваш-домен/dns-query",
             style="Muted.TLabel",
         )
         self.lbl_doh_hint.pack(anchor="w")
@@ -4373,7 +4373,7 @@ class App(tk.Tk):
                     messagebox.showerror(
                         APP_NAME,
                         "Некорректный формат IP-адресов.\n"
-                        "Пример: 77.90.47.223 или 77.90.47.223:853 через запятую.",
+                        "Укажите IPv4-адрес (или IPv4:порт) вашего сервера через запятую.",
                     )
                     return None
                 clean_url = _clean_doh_url(self.ent_doh.get())
@@ -4411,8 +4411,7 @@ class App(tk.Tk):
             if targets is None:
                 messagebox.showerror(
                     APP_NAME,
-                    "Впишите корректные IPv4-адреса (или IP:порт) через запятую,\n"
-                    "например: 9.9.9.9, 149.112.112.112:853",
+                    "Впишите корректные IPv4-адреса (или IPv4:порт) вашего сервера через запятую.",
                 )
                 return None
             if not targets:
@@ -5242,7 +5241,7 @@ def _cli_build_upstreams():
                 if targets:
                     break
             except ValueError as e:
-                print(f"✘ {e}. Пример: 9.9.9.9, 149.112.112.112:853")
+                print(f"✘ {e}. Укажите ваш IPv4 или IPv4:порт через запятую.")
 
     ips = [ip for ip, _ in targets]
     default_verify = "y" if proto == "doh_url" else "n"
