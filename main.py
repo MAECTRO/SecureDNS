@@ -48,7 +48,8 @@ except ImportError:
     winreg = None
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.5.2"
+APP_VERSION = "1.3.6"
+DEFAULT_DOH_PLACEHOLDER = "https://example.com/dns-query"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
 LOCAL_DNS = "127.0.0.1"
@@ -285,6 +286,68 @@ def _clean_sni_host(raw: str) -> str | None:
         return host or None
     host = s.split(":", 1)[0].strip().strip(".")
     return host or None
+
+
+def _clean_doh_url(raw: str) -> str:
+    """Очищает URL DoH и отбрасывает пример https://example.com/dns-query."""
+    s = str(raw or "").strip()
+    if not s or s.rstrip("/").lower() == DEFAULT_DOH_PLACEHOLDER.rstrip("/"):
+        return ""
+    return s
+
+
+def _extract_https_url(raw: str) -> str | None:
+    """Находит первую https:// ссылку внутри произвольного текста или поля ввода."""
+    for tok in re.split(r"[\s,;]+", str(raw or "").strip()):
+        if tok.lower().startswith("https://"):
+            return tok
+    return None
+
+
+def _with_url_port(url: str, port: int) -> str:
+    """Меняет порт в URL, корректно обрабатывая стандартный 443."""
+    from urllib.parse import urlparse, urlunparse
+    u = urlparse(url)
+    host = u.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host if int(port) == 443 else f"{host}:{int(port)}"
+    if u.username:
+        auth = f"{u.username}:{u.password}@" if u.password is not None else f"{u.username}@"
+        netloc = auth + netloc
+    return urlunparse((u.scheme, netloc, u.path or "/dns-query", u.params, u.query, u.fragment))
+
+
+def parse_ip_targets(raw: str, default_port: int = 853) -> list[tuple[str, int]]:
+    """Разбирает список IP[:порт] (разделители: запятая, ;, пробел, перенос; убирает tls://)."""
+    out = []
+    seen = set()
+    for tok in re.split(r"[\s,;]+", str(raw or "").strip()):
+        if not tok:
+            continue
+        s = tok
+        if s.lower().startswith(("tls://", "dot://")):
+            s = s.split("://", 1)[1].rstrip("/")
+        if ":" in s:
+            ip_part, port_part = s.rsplit(":", 1)
+            if not port_part.isdigit():
+                raise ValueError(f"некорректный порт в «{tok}»")
+            port = int(port_part)
+            if not (1 <= port <= 65535):
+                raise ValueError(f"порт вне диапазона 1..65535 в «{tok}»")
+        else:
+            ip_part, port = s, int(default_port)
+        if not _valid_ip(ip_part):
+            raise ValueError(f"некорректный IP «{tok}»")
+        key = (ip_part, port)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def format_ip_targets(targets: list[tuple[str, int]], default_port: int = 853) -> str:
+    return ", ".join(ip if p == default_port else f"{ip}:{p}" for ip, p in targets)
 
 
 def _is_win_default_v6_dns(addr: str) -> bool:
@@ -1953,6 +2016,136 @@ def probe_transports(ips: list[str], doh_url: str = "", sni: str | None = None,
     return results
 
 
+def resolve_auto_upstreams(ip_targets: list[tuple[str, int]], doh_url: str = "",
+                           direct_dns_ips: list[str] | None = None,
+                           verify_dot: bool = True) -> tuple[list, str, list[tuple[str, bool, str]]]:
+    """Автоматически подбирает первый рабочий транспорт (:853 -> DoH :443 -> :443 3B -> :8443)."""
+    from urllib.parse import urlparse
+    clean_url = _clean_doh_url(doh_url)
+    targets = list(ip_targets or [])
+    if not targets and not clean_url:
+        raise ValueError("Укажите IP-адреса сервера и/или ссылку DoH https://...")
+
+    q = build_dns_query("example.com")
+    report_rows: list[tuple[str, bool, str]] = []
+
+    if not clean_url:
+        working_msg = None
+        last_err = None
+        for ip, port in targets:
+            up = DoTUpstream(ip, port, verify=False, timeout=5.0, connect_timeout=4.0)
+            t0 = time.monotonic()
+            try:
+                resp = up.query(q)
+                ms = int((time.monotonic() - t0) * 1000)
+                ans = ", ".join(parse_answers(resp)) or "OK"
+                report_rows.append((f"DoT :{port} ({ip})", True, f"✔ {ms} мс ({ans})"))
+                if working_msg is None:
+                    working_msg = f"Авто → DoT ({format_ip_targets(targets)})"
+                    break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                report_rows.append((f"DoT :{port} ({ip})", False, f"✘ {e}"))
+            finally:
+                up.close()
+        if working_msg is not None:
+            return [DoTUpstream(ip, port, verify=False) for ip, port in targets], working_msg, report_rows
+        tls_rows = probe_transports([targets[0][0]], doh_url="", sni=None, verify=False, direct_dns_ips=direct_dns_ips)
+        for row in tls_rows:
+            if not row[0].startswith("DoT "):
+                report_rows.append(row)
+        open_hints = [lbl for lbl, ok, _ in report_rows if ok]
+        if open_hints:
+            raise IOError(
+                f"Порт :853 не отвечает ({last_err}), но доступны: {', '.join(open_hints)}. "
+                f"Добавьте ссылку DoH (https://.../dns-query) для автоперехода."
+            )
+        raise IOError(f"Ни один транспорт не отвечает (последняя ошибка: {last_err})")
+
+    if not clean_url.lower().startswith("https://"):
+        raise ValueError("DoH-ссылка должна начинаться с https://")
+    u = urlparse(clean_url)
+    host = u.hostname or ""
+    path = (u.path or "/dns-query") + (f"?{u.query}" if u.query else "")
+    if not host:
+        raise ValueError("Некорректный DoH URL")
+
+    explicit_ips = bool(targets)
+    if targets:
+        probe_list = targets[:2]
+        final_ips = [ip for ip, _ in targets]
+    else:
+        resolved = resolve_bootstrap_ips(host, direct_dns_ips=direct_dns_ips)
+        if not resolved:
+            raise IOError(f"Не удалось определить IP для {host}. Проверьте ссылку и интернет.")
+        probe_list = [(resolved[0], 853)]
+        final_ips = resolved
+
+    def _run_doh(p_ip: str, tgt_url: str, use_split: bool):
+        pu = urlparse(tgt_url)
+        p_port = pu.port or 443
+        detail = _strict_doh_probe(p_ip, host, p_port, path, True, use_split)
+        return True, detail
+
+    def _run_dot(p_ip: str, p_port: int):
+        t0 = time.monotonic()
+        up = DoTUpstream(p_ip, p_port, verify=bool(verify_dot), hostname=host, timeout=5.0, connect_timeout=4.0)
+        try:
+            resp = up.query(q)
+            ms = int((time.monotonic() - t0) * 1000)
+            ans = ", ".join(parse_answers(resp)) or "OK"
+            return True, f"✔ {ms} мс ({ans})"
+        finally:
+            up.close()
+
+    for probe_ip, dot_port in probe_list:
+        cands = []
+        if explicit_ips:
+            cands.append((1, f"DoT :{dot_port} ({probe_ip})", "dot", dot_port, False, lambda ip=probe_ip, dp=dot_port: _run_dot(ip, dp)))
+        if u.port and u.port != 443:
+            cands.append((2, f"DoH :{u.port} ({probe_ip})", clean_url, u.port, False, lambda ip=probe_ip, url_=clean_url: _run_doh(ip, url_, False)))
+        else:
+            cands.append((2, f"DoH :443 цельный ({probe_ip})", clean_url, 443, False, lambda ip=probe_ip, url_=clean_url: _run_doh(ip, url_, False)))
+            cands.append((3, f"DoH :443 резка 3B ({probe_ip})", clean_url, 443, True, lambda ip=probe_ip, url_=clean_url: _run_doh(ip, url_, True)))
+            url_8443 = _with_url_port(clean_url, 8443)
+            cands.append((4, f"DoH :8443 ({probe_ip})", url_8443, 8443, False, lambda ip=probe_ip, url_=url_8443: _run_doh(ip, url_, False)))
+
+        cand_results = [None] * len(cands)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(cands)) as pool:
+            futs = {pool.submit(fn): idx for idx, (*_, fn) in enumerate(cands)}
+            for fut, idx in futs.items():
+                lbl = cands[idx][1]
+                try:
+                    ok, msg = fut.result()
+                    cand_results[idx] = (True, msg)
+                    report_rows.append((lbl, True, msg))
+                except Exception as e:  # noqa: BLE001
+                    cand_results[idx] = (False, str(e))
+                    report_rows.append((lbl, False, f"✘ {e}"))
+
+        for idx, (prio, lbl, kind_or_url, port_num, use_split, _) in enumerate(cands):
+            ok, _msg = cand_results[idx]
+            if not ok:
+                continue
+            if kind_or_url == "dot":
+                ups = [DoTUpstream(ip, p, verify=bool(verify_dot), hostname=host) for ip, p in targets]
+                desc = f"Авто → DoT:{dot_port} ({format_ip_targets(targets)})"
+                return ups, desc, report_rows
+            ups = [
+                DoHUpstream(
+                    kind_or_url, verify=True, bootstrap_ips=[ip],
+                    split_hello=use_split, bootstrap_dns_ips=direct_dns_ips,
+                )
+                for ip in final_ips
+            ]
+            split_sfx = " + резка 3B" if use_split else ""
+            desc = f"Авто → DoH :{port_num}{split_sfx} ({', '.join(final_ips)})"
+            return ups, desc, report_rows
+
+    last_fail = next((msg for _, ok, msg in reversed(report_rows) if not ok), "timed out")
+    raise IOError(f"Ни один транспорт не ответил ({last_fail})")
+
+
 # ---------------------------------------------------------------------------
 # Локальный TTL-кэш DNS (Serve-Stale при сбое сети)
 # ---------------------------------------------------------------------------
@@ -2600,6 +2793,10 @@ class LocalDNSProxy:
         with self._dynamic_lock:
             self._dynamic_split.clear()
 
+    def clear_cache(self):
+        if self._dns_cache is not None:
+            self._dns_cache.clear()
+
 
 # ---------------------------------------------------------------------------
 # Тестовый DNS-запрос (собираем пакет вручную, без внешних библиотек)
@@ -2665,16 +2862,16 @@ CONFIG_LINK_PREFIX = "securedns://v1/"
 
 def export_config_link(cfg: dict) -> str:
     """Кодирует настройки SecureDNS в компактную строку securedns://v1/... для обмена в чате."""
-    proto = str(cfg.get("proto") or "dot").strip()
-    if proto not in ("dot", "doh", "doh_url"):
-        proto = "dot"
+    proto = str(cfg.get("proto") or "auto").strip()
+    if proto not in ("auto", "dot", "doh", "doh_url"):
+        proto = "auto"
     raw_doms = list(parse_split_domains(cfg.get("split_domains", [])))
     doms_val = "default" if raw_doms == list(DEFAULT_SPLIT_DOMAINS) else raw_doms
     payload = {
         "v": 1,
         "proto": proto,
         "ips": str(cfg.get("ips") or "").strip(),
-        "doh": str(cfg.get("doh_url") or "").strip(),
+        "doh": _clean_doh_url(str(cfg.get("doh_url") or "")),
         "sni": _clean_sni_host(str(cfg.get("sni") or "")) or "",
         "verify": bool(cfg.get("verify", False)),
         "v6q": bool(cfg.get("block_v6_quic", True)),
@@ -2712,24 +2909,19 @@ def import_config_link(raw: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError("некорректный формат конфига")
     proto = str(data.get("proto") or "dot").strip()
-    if proto not in ("dot", "doh", "doh_url"):
+    if proto not in ("auto", "dot", "doh", "doh_url"):
         raise ValueError(f"неизвестный протокол: {proto}")
 
     ips_raw = str(data.get("ips") or "").strip()
-    ips_list = [x.strip() for x in ips_raw.split(",") if x.strip()]
-    bad_ips = [x for x in ips_list if not _valid_ip(x)]
-    if bad_ips:
-        raise ValueError(f"некорректные IP: {', '.join(bad_ips)}")
+    targets = parse_ip_targets(ips_raw) if ips_raw else []
+    ips_fmt = format_ip_targets(targets)
 
-    doh_url = str(data.get("doh") or data.get("doh_url") or "").strip()
+    doh_url = _clean_doh_url(str(data.get("doh") or data.get("doh_url") or ""))
     if proto in ("doh", "doh_url") and not doh_url.startswith("https://"):
         raise ValueError("для DoH нужна ссылка https://...")
 
     dir_raw = str(data.get("dir") or data.get("direct_dns") or "").strip()
-    dir_list = [x.strip() for x in dir_raw.split(",") if x.strip()]
-    bad_dir = [x for x in dir_list if not _valid_ip(x)]
-    if bad_dir:
-        raise ValueError(f"некорректный прямой DNS: {', '.join(bad_dir)}")
+    dir_list = [ip for ip, _ in parse_ip_targets(dir_raw)] if dir_raw else []
 
     doms_raw = data.get("doms") if "doms" in data else data.get("split_domains", "default")
     if doms_raw == "default" or doms_raw is None:
@@ -2739,7 +2931,7 @@ def import_config_link(raw: str) -> dict:
 
     return {
         "proto": proto,
-        "ips": ", ".join(ips_list),
+        "ips": ips_fmt,
         "doh_url": doh_url,
         "sni": _clean_sni_host(str(data.get("sni") or "")) or "",
         "verify": bool(data.get("verify", proto == "doh_url")),
@@ -2761,18 +2953,18 @@ BEGINNER_GUIDE_SECTIONS = (
         ),
     ),
     (
-        "Шаг 2. Как ввести настройки (выберите один вариант)",
+        "Шаг 2. Как ввести настройки (выберите свой вариант)",
         (
-            "• Вариант А — вам скинули строку securedns://v1/...:\n"
-            "  Скопируйте её и нажмите кнопку «Вставить конфиг» в правом верхнем углу. Всё заполнится само.",
-            "• Вариант Б — есть только ссылка https://.../dns-query:\n"
-            "  Выберите «DoH (как в Chrome)», вставьте ссылку в поле URL и оставьте галочку «Проверять TLS-сертификат».",
-            "• Вариант В — дали только IP-адреса (один или через запятую):\n"
-            "  Оставьте «DoT — порт 853 по IP» и впишите IP. Если домен не дали — снимите «Проверять TLS-сертификат».\n"
-            "  Если вместе с IP дали домен — впишите его в «Домен сертификата SNI» и оставьте проверку сертификата.",
-            "• Вариант Г — есть и ссылка https://..., и IP-адрес:\n"
-            "  Выберите «DoH по своим IP» и заполните оба поля. Если провайдер режет порт 443, допишите :8443:\n"
-            "  https://ваш-домен:8443/dns-query",
+            "• Вариант А — вам скинули строку securedns://v1/... (или скопировали URL / IP):\n"
+            "  Скопируйте в буфер и нажмите «Вставить конфиг» в правом верхнем углу — поля заполнятся сами.\n"
+            "  В любом поле работают Ctrl+C / Ctrl+V / Ctrl+A даже на русской раскладке и меню правой кнопкой.",
+            "• Вариант Б — самый простой режим «Авто» (включён по умолчанию):\n"
+            "  Просто вставьте то, что вам дали: только IP (и даже IP:порт), только ссылку https://..., либо оба поля.\n"
+            "  При нажатии «Включить» программа сама проверит :853, :443, :443 резку 3B и :8443 и выберет рабочий.",
+            "• Вариант В — ручной выбор строгого режима:\n"
+            "  - «DoT :853» — только IP (или IP:порт). Поле SNI появится, если включить «Проверять TLS-сертификат».\n"
+            "  - «DoH по URL (как в Chrome)» — только ссылка https://.../dns-query без ввода IP.\n"
+            "  - «DoH по своим IP» — ссылка https://... + явные IP (при потерях на :443 можно дописать :8443).",
         ),
     ),
     (
@@ -2782,22 +2974,19 @@ BEGINNER_GUIDE_SECTIONS = (
             "• «Раздельный DNS» — включайте, если нужны только нейросети (список «Домены…»), а обычные сайты,\n"
             "  банки и игры должны идти напрямую от вашего провайдера.",
             "• «Сворачивать в трей при закрытии» и «Автозапуск с Windows» — по желанию для фоновой работы.",
-            "• «Резать ClientHello по 3 байта (:443)» и «Блок UDP:443 QUIC в Firewall» — включайте только если\n"
-            "  без них сайты не открываются или соединение обрывается по таймауту.",
-            "• Кнопка «Откл. DoH Chrome/Edge» вверху — нажмите, если в строке «Браузеры (DoH)» написано,\n"
-            "  что в браузере включён собственный защищённый DNS.",
+            "• Кнопка «Откл. DoH Chrome/Edge» вверху — нажмите, если статус «Браузеры (DoH)» показывает, что\n"
+            "  в Chrome / Edge / Яндексе включён свой встроенный защищённый DNS.",
         ),
     ),
     (
-        "Шаг 4. Включение, проверка и что делать при сбое",
+        "Шаг 4. Проверка, счётчики и что делать при сбое",
         (
-            "1. Нажмите синюю кнопку «Включить шифрованный DNS», дождитесь зелёной строки и нажмите «Проверить».\n"
-            "   Надпись «✔ Шифрованный канал работает» значит, что всё настроено правильно.",
-            "2. Пока защита работает, полностью выходить из программы не нужно — пусть висит в трее.\n"
-            "   Перед выключением сначала нажмите «Отключить», чтобы вернуть обычный DNS.",
-            "3. Если при старте пишет timed out — нажмите «Тест портов». Программа сразу проверит :853,\n"
-            "   цельный :443, :443 с резкой 3B и :8443 и покажет галочкой рабочий вариант у вашего провайдера.",
-            "4. Если всё равно нужна помощь — нажмите «Сохранить лог (.txt)» над журналом и отправьте файл.",
+            "1. Нажмите «Включить шифрованный DNS», затем «Проверить» — покажет IP ответа и время в мс.\n"
+            "   Под статусом в реальном времени считаются запросы, попадания в кэш, блокировки v6/QUIC и ошибки.",
+            "2. Кнопка «Сбросить кэш» над журналом очищает локальный и системный DNS-кэш в один клик.",
+            "3. Если в ручном «DoT :853» порт закрыт — программа сама проверит :443 / резку 3B / :8443 и предложит\n"
+            "   переключиться в один клик. Либо просто используйте режим «Авто» или кнопку «Тест портов».",
+            "4. Пока защита включена, программу закрывать не надо (пусть висит в трее). Для возврата — «Отключить».",
         ),
     ),
 )
@@ -3002,6 +3191,276 @@ BG, PANEL, FG, MUTED = "#1b1e24", "#242832", "#e6e8ec", "#9aa3b2"
 ACCENT, GREEN, RED = "#3d8bfd", "#2ecc71", "#e74c3c"
 
 
+def _clipboard_win_get() -> str | None:
+    if not IS_WINDOWS:
+        return None
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_int
+    user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    user32.IsClipboardFormatAvailable.restype = ctypes.c_int
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+
+    for _ in range(3):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.01)
+    else:
+        return None
+    try:
+        if not user32.IsClipboardFormatAvailable(13):
+            return ""
+        handle = user32.GetClipboardData(13)
+        if not handle:
+            return ""
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr) or ""
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _clipboard_win_set(text: str) -> bool:
+    if not IS_WINDOWS:
+        return False
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_int
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    raw = (str(text) + "\x00").encode("utf-16-le")
+    hmem = kernel32.GlobalAlloc(0x0002, len(raw))
+    if not hmem:
+        return False
+    ptr = kernel32.GlobalLock(hmem)
+    if not ptr:
+        kernel32.GlobalFree(hmem)
+        return False
+    try:
+        ctypes.memmove(ptr, raw, len(raw))
+    finally:
+        kernel32.GlobalUnlock(hmem)
+
+    for _ in range(3):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.01)
+    else:
+        kernel32.GlobalFree(hmem)
+        return False
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(13, hmem):
+            kernel32.GlobalFree(hmem)
+            return False
+        hmem = None
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+def _clipboard_get(widget) -> str:
+    if IS_WINDOWS:
+        win_txt = _clipboard_win_get()
+        if win_txt is not None:
+            return win_txt
+    try:
+        return str(widget.clipboard_get() or "")
+    except tk.TclError:
+        return ""
+
+
+def _clipboard_set(widget, text: str):
+    if IS_WINDOWS and _clipboard_win_set(text):
+        return
+    widget.clipboard_clear()
+    widget.clipboard_append(text)
+    widget.update()
+
+
+def _widget_editable(w) -> bool:
+    try:
+        if hasattr(w, "instate"):
+            return not (w.instate(["disabled"]) or w.instate(["readonly"]))
+        return str(w.cget("state")) not in ("disabled", "readonly")
+    except tk.TclError:
+        return False
+
+
+def _widget_get_selection(w) -> str | None:
+    try:
+        if isinstance(w, tk.Text):
+            ranges = w.tag_ranges("sel")
+            return w.get(ranges[0], ranges[1]) if ranges else None
+        return w.selection_get() if w.selection_present() else None
+    except tk.TclError:
+        return None
+
+
+def _widget_select_all(w):
+    if isinstance(w, tk.Text):
+        w.tag_add("sel", "1.0", "end-1c")
+        w.mark_set("insert", "end-1c")
+    else:
+        w.selection_range(0, "end")
+        w.icursor("end")
+
+
+def _widget_copy(w):
+    sel = _widget_get_selection(w)
+    if sel is not None:
+        _clipboard_set(w, sel)
+
+
+def _widget_cut(w):
+    if not _widget_editable(w):
+        return
+    sel = _widget_get_selection(w)
+    if sel is None:
+        return
+    _clipboard_set(w, sel)
+    try:
+        w.delete("sel.first", "sel.last")
+    except tk.TclError:
+        pass
+
+
+def _widget_paste(w):
+    if not _widget_editable(w):
+        return
+    txt = _clipboard_get(w)
+    if not txt:
+        return
+    if isinstance(w, tk.Text):
+        if w.tag_ranges("sel"):
+            try:
+                w.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+        w.insert("insert", txt)
+    else:
+        if _widget_get_selection(w) is not None:
+            try:
+                w.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+        lines = [ln.strip() for ln in txt.replace("\r\n", "\n").replace("\r", "\n").splitlines() if ln.strip()]
+        if len(lines) > 1:
+            sep = ", " if all(re.match(r"^[0-9.:a-zA-Z/-]+$", x) and "://" not in x for x in lines) else " "
+            clean = sep.join(lines)
+        elif lines:
+            clean = lines[0]
+        else:
+            clean = ""
+        w.insert("insert", clean)
+
+
+_VK_TO_CLIP_ACT = {65: "a", 67: "c", 86: "v", 88: "x"}
+_KEYSYM_TO_CLIP_ACT = {
+    "a": "a", "cyrillic_ef": "a",
+    "c": "c", "cyrillic_es": "c",
+    "v": "v", "cyrillic_em": "v",
+    "x": "x", "cyrillic_che": "x",
+}
+
+
+def _install_clipboard_support(root: tk.Tk):
+    """Включает Ctrl+C/V/X/A на русской/любой раскладке и контекстное меню ПКМ для всех полей."""
+    menu = tk.Menu(
+        root, tearoff=0, bg=PANEL, fg=FG,
+        activebackground=ACCENT, activeforeground="white", relief="flat",
+    )
+
+    def run_act(w, act: str):
+        if act == "a":
+            _widget_select_all(w)
+        elif act == "c":
+            _widget_copy(w)
+        elif act == "x":
+            _widget_cut(w)
+        elif act == "v":
+            _widget_paste(w)
+        return "break"
+
+    def on_ctrl_key(event):
+        if (event.state & 0x20000) or (event.state & 0x8):
+            return
+        act = (_VK_TO_CLIP_ACT.get(event.keycode) if IS_WINDOWS else None) or _KEYSYM_TO_CLIP_ACT.get(
+            str(event.keysym or "").lower()
+        )
+        if not act:
+            return
+        return run_act(event.widget, act)
+
+    root._clip_handler = on_ctrl_key
+
+    def show_ctx_menu(event):
+        w = event.widget
+        try:
+            w.focus_set()
+        except tk.TclError:
+            pass
+        editable = _widget_editable(w)
+        has_sel = _widget_get_selection(w) is not None
+        menu.delete(0, "end")
+        if editable:
+            menu.add_command(label="Вырезать", state="normal" if has_sel else "disabled", command=lambda w=w: _widget_cut(w))
+            menu.add_command(label="Копировать", state="normal" if has_sel else "disabled", command=lambda w=w: _widget_copy(w))
+            menu.add_command(label="Вставить", command=lambda w=w: _widget_paste(w))
+            menu.add_separator()
+            menu.add_command(label="Выделить всё", command=lambda w=w: _widget_select_all(w))
+        else:
+            menu.add_command(label="Копировать", state="normal" if has_sel else "disabled", command=lambda w=w: _widget_copy(w))
+            menu.add_command(label="Выделить всё", command=lambda w=w: _widget_select_all(w))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    for cls in ("TEntry", "Entry", "Text"):
+        root.bind_class(cls, "<<SelectAll>>", lambda e: run_act(e.widget, "a"))
+        root.bind_class(cls, "<<Copy>>", lambda e: run_act(e.widget, "c"))
+        root.bind_class(cls, "<<Cut>>", lambda e: run_act(e.widget, "x"))
+        root.bind_class(cls, "<<Paste>>", lambda e: run_act(e.widget, "v"))
+        for ch in ("a", "c", "v", "x"):
+            root.bind_class(cls, f"<Control-{ch}>", lambda e, act=ch: run_act(e.widget, act))
+            root.bind_class(cls, f"<Control-{ch.upper()}>", lambda e, act=ch: run_act(e.widget, act))
+        root.bind_class(cls, "<Control-KeyPress>", on_ctrl_key, add="+")
+        root.bind_class(cls, "<Control-Insert>", lambda e: run_act(e.widget, "c"))
+        root.bind_class(cls, "<Shift-Insert>", lambda e: run_act(e.widget, "v"))
+        root.bind_class(cls, "<Button-3>", show_ctx_menu, add="+")
+        if cls == "Text":
+            root.bind_class(cls, "<Button-1>", lambda e: e.widget.focus_set(), add="+")
+
+
 class App(tk.Tk):
     def __init__(self, autostart: bool = False, enable_tray: bool = True):
         super().__init__()
@@ -3026,20 +3485,26 @@ class App(tk.Tk):
         self._browser_doh_info = {}
         self._tray = None
         self._help_win = None
+        self._last_stats_tick = 0.0
         self.btn_update = None
         self.btn_help = None
         self.btn_save_log = None
+        self.btn_flush_cache = None
+        self.btn_clear_log = None
         self.btn_split_edit = None
         self.btn_probe = None
         self.btn_copy_cfg = None
         self.btn_paste_cfg = None
         self.btn_browser_doh = None
         self.chk_autostart = None
+        self.chk_verify = None
+        self.chk_split_hello = None
         self.split_domains = list(DEFAULT_SPLIT_DOMAINS)
         self.direct_dns_raw = ""
         self.q = queue.Queue()
         log_session_header("GUI-autostart" if autostart else "GUI")
         self._build_ui()
+        _install_clipboard_support(self)
         self._load_config()
         if enable_tray and IS_WINDOWS:
             self._tray = Win32Tray(
@@ -3155,6 +3620,8 @@ class App(tk.Tk):
         self.lbl_dns.pack(anchor="w")
         self.lbl_proxy = ttk.Label(st, text="Прокси: остановлен", style="PanelMuted.TLabel")
         self.lbl_proxy.pack(anchor="w")
+        self.lbl_stats = ttk.Label(st, text="Счётчики: ожидание запуска", style="PanelMuted.TLabel")
+        self.lbl_stats.pack(anchor="w")
 
         brow_row = ttk.Frame(st, style="Panel.TFrame")
         brow_row.pack(fill="x", pady=(2, 0))
@@ -3177,38 +3644,47 @@ class App(tk.Tk):
         self.cmb_adapter.pack(fill="x", pady=(3, 0))
         self.cmb_adapter.bind("<<ComboboxSelected>>", lambda e: self.refresh_status())
 
-        # Протокол и параметры подключения
+        # Протокол и параметры подключения (компактная сетка 2x2)
         proto_frm = ttk.Frame(self)
-        proto_frm.pack(fill="x", padx=16, pady=(8, 0))
+        proto_frm.pack(fill="x", padx=16, pady=(6, 0))
         ttk.Label(proto_frm, text="Способ подключения:").pack(anchor="w")
-        self.var_proto = tk.StringVar(value="dot")
+        proto_grid = ttk.Frame(proto_frm)
+        proto_grid.pack(fill="x", pady=(2, 0))
+        proto_grid.columnconfigure(0, weight=1)
+        proto_grid.columnconfigure(1, weight=1)
+        self.var_proto = tk.StringVar(value="auto")
         ttk.Radiobutton(
-            proto_frm,
-            text="DoT — порт 853 по IP (рекомендуется для РФ — без потерь :443)",
+            proto_grid,
+            text="Авто (сам найдёт :853 / :443 / :8443)",
+            variable=self.var_proto, value="auto", command=self._on_proto_user_click,
+        ).grid(row=0, column=0, sticky="w", pady=1)
+        ttk.Radiobutton(
+            proto_grid,
+            text="DoT :853 (по IP)",
             variable=self.var_proto, value="dot", command=self._on_proto_user_click,
-        ).pack(anchor="w", pady=(3, 0))
+        ).grid(row=0, column=1, sticky="w", pady=1)
         ttk.Radiobutton(
-            proto_frm,
-            text="DoH (как в Chrome) — только URL шаблона, без ввода IP",
+            proto_grid,
+            text="DoH по URL (как в Chrome)",
             variable=self.var_proto, value="doh_url", command=self._on_proto_user_click,
-        ).pack(anchor="w")
+        ).grid(row=1, column=0, sticky="w", pady=1)
         ttk.Radiobutton(
-            proto_frm,
-            text="DoH по своим IP — URL шаблона + явные IP серверов",
+            proto_grid,
+            text="DoH по своим IP (:443 / :8443)",
             variable=self.var_proto, value="doh", command=self._on_proto_user_click,
-        ).pack(anchor="w")
+        ).grid(row=1, column=1, sticky="w", pady=1)
 
         self.frm_conn = ttk.Frame(self)
         self.frm_conn.pack(fill="x", padx=16, pady=(6, 0))
 
         self.frm_ips = ttk.Frame(self.frm_conn)
-        self.lbl_ips = ttk.Label(self.frm_ips, text="Ваши DNS-серверы (IP через запятую — любые):")
+        self.lbl_ips = ttk.Label(self.frm_ips, text="IP-адреса серверов (если есть):")
         self.lbl_ips.pack(anchor="w")
         self.ent_ips = ttk.Entry(self.frm_ips)
         self.ent_ips.pack(fill="x", pady=(2, 0))
         self.lbl_ips_hint = ttk.Label(
             self.frm_ips,
-            text="Порядок важен: при недоступности первого запросы уходят на следующий.",
+            text="Порядок важен. Поддерживается ip:порт.",
             style="Muted.TLabel",
         )
         self.lbl_ips_hint.pack(anchor="w")
@@ -3217,11 +3693,10 @@ class App(tk.Tk):
         self.lbl_doh = ttk.Label(self.frm_doh, text="URL DoH-сервера (https://...):")
         self.lbl_doh.pack(anchor="w")
         self.ent_doh = ttk.Entry(self.frm_doh)
-        self.ent_doh.insert(0, "https://example.com/dns-query")
         self.ent_doh.pack(fill="x", pady=(2, 0))
         self.lbl_doh_hint = ttk.Label(
             self.frm_doh,
-            text="В РФ при потерях :443 можно дописать :8443: https://домен:8443/dns-query",
+            text="Например: https://dns.example.com/dns-query",
             style="Muted.TLabel",
         )
         self.lbl_doh_hint.pack(anchor="w")
@@ -3229,54 +3704,58 @@ class App(tk.Tk):
         self.frm_sni = ttk.Frame(self.frm_conn)
         ttk.Label(
             self.frm_sni,
-            text="Домен сертификата SNI (для проверки TLS по IP, необязательно):",
+            text="Домен сертификата SNI (для строгой проверки по IP):",
             style="Muted.TLabel",
         ).pack(anchor="w")
         self.ent_sni = ttk.Entry(self.frm_sni)
         self.ent_sni.pack(fill="x", pady=(2, 0))
 
-        # Компактная сетка опций (2 колонки)
+        # Опции конкретного режима (показываются динамически)
+        self.mode_opts_frm = ttk.Frame(self)
+        self.mode_opts_frm.pack(fill="x", padx=16, pady=(4, 0))
+        self.var_verify = tk.BooleanVar(value=False)
+        self.chk_verify = ttk.Checkbutton(
+            self.mode_opts_frm, text="Проверять TLS-сертификат",
+            variable=self.var_verify, command=self._on_proto,
+        )
+        self.var_split_hello = tk.BooleanVar(value=False)
+        self.chk_split_hello = ttk.Checkbutton(
+            self.mode_opts_frm, text="Резать ClientHello по 3 байта (:443)",
+            variable=self.var_split_hello,
+        )
+
+        # Общие опции (2 колонки)
         opts_frm = ttk.Frame(self)
-        opts_frm.pack(fill="x", padx=16, pady=(6, 0))
+        opts_frm.pack(fill="x", padx=16, pady=(4, 0))
         opts_frm.columnconfigure(0, weight=1)
         opts_frm.columnconfigure(1, weight=1)
-
-        self.var_verify = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            opts_frm, text="Проверять TLS-сертификат", variable=self.var_verify
-        ).grid(row=0, column=0, sticky="w", pady=1)
 
         self.var_block_v6_quic = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             opts_frm, text="Блокировать IPv6 и QUIC (AAAA/SVCB)", variable=self.var_block_v6_quic
-        ).grid(row=0, column=1, sticky="w", pady=1)
-
-        self.var_split_hello = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            opts_frm, text="Резать ClientHello по 3 байта (:443)", variable=self.var_split_hello
-        ).grid(row=1, column=0, sticky="w", pady=1)
+        ).grid(row=0, column=0, sticky="w", pady=1)
 
         self.var_fw_quic = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             opts_frm, text="Блок UDP:443 QUIC в Firewall", variable=self.var_fw_quic
-        ).grid(row=1, column=1, sticky="w", pady=1)
+        ).grid(row=0, column=1, sticky="w", pady=1)
 
         self.var_tray = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             opts_frm, text="Сворачивать в трей при закрытии", variable=self.var_tray
-        ).grid(row=2, column=0, sticky="w", pady=1)
+        ).grid(row=1, column=0, sticky="w", pady=1)
 
         self.var_autostart = tk.BooleanVar(value=False)
         self.chk_autostart = ttk.Checkbutton(
             opts_frm, text="Автозапуск с Windows",
             variable=self.var_autostart, command=self.on_toggle_autostart,
         )
-        self.chk_autostart.grid(row=2, column=1, sticky="w", pady=1)
+        self.chk_autostart.grid(row=1, column=1, sticky="w", pady=1)
         if not IS_WINDOWS:
             self.chk_autostart.configure(state="disabled")
 
         split_row = ttk.Frame(opts_frm)
-        split_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        split_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
         self.var_split_dns = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             split_row,
@@ -3314,14 +3793,22 @@ class App(tk.Tk):
             log_bar, text="Сохранить лог (.txt)", style="Small.TButton", command=self.on_save_log
         )
         self.btn_save_log.pack(side="right")
+        self.btn_flush_cache = ttk.Button(
+            log_bar, text="Сбросить кэш", style="Small.TButton", command=self.on_flush_cache
+        )
+        self.btn_flush_cache.pack(side="right", padx=(0, 6))
+        self.btn_clear_log = ttk.Button(
+            log_bar, text="Очистить", style="Small.TButton", command=self.on_clear_log
+        )
+        self.btn_clear_log.pack(side="right", padx=(0, 6))
 
         self.txt_log = tk.Text(self, bg="#12141a", fg="#b8c0cc", insertbackground=FG,
                                font=("Consolas", 9), wrap="word", relief="flat",
-                               height=8, state="disabled")
+                               height=7, state="disabled")
         self.txt_log.pack(fill="both", expand=True, padx=16, pady=(0, 12))
 
-        self.log(f"{APP_NAME} {APP_VERSION}. Выберите режим (DoT по IP или чистый DoH по ссылке) "
-                 f"и нажмите «Включить» (памятка: «? Инструкция» вверху).")
+        self.log(f"{APP_NAME} {APP_VERSION}. Выбран «Авто» — впишите IP и/или URL и нажмите «Включить» "
+                 f"(памятка: «? Инструкция» вверху).")
 
     # ---------- утилиты UI ----------
     def log(self, msg: str):
@@ -3339,7 +3826,7 @@ class App(tk.Tk):
         state = "disabled" if busy else "normal"
         for btn in (
             self.btn_on, self.btn_off, self.btn_test, self.btn_probe,
-            self.btn_refresh, self.btn_save_log, self.btn_split_edit,
+            self.btn_refresh, self.btn_save_log, self.btn_flush_cache, self.btn_split_edit,
             self.btn_copy_cfg, self.btn_paste_cfg, self.btn_browser_doh, self.btn_update,
         ):
             if btn is not None:
@@ -3382,6 +3869,8 @@ class App(tk.Tk):
                     self._show_update_button(payload)
                 elif kind == "log_saved":
                     self._on_log_saved(payload)
+                elif kind == "offer_switch_doh":
+                    self._on_offer_switch_doh(payload)
                 elif kind == "tray_show":
                     self.deiconify()
                     self.lift()
@@ -3406,6 +3895,11 @@ class App(tk.Tk):
                     self._set_busy(False)
         except queue.Empty:
             pass
+        if self.proxy is not None:
+            now = time.monotonic()
+            if now - self._last_stats_tick >= 1.2:
+                self._last_stats_tick = now
+                self._update_live_stats()
         self.after(80, self._poll_queue)
 
     def _on_proto_user_click(self):
@@ -3417,29 +3911,56 @@ class App(tk.Tk):
         proto = self.var_proto.get()
         for child in (self.frm_ips, self.frm_doh, self.frm_sni):
             child.pack_forget()
+        for cb in (self.chk_verify, self.chk_split_hello):
+            cb.pack_forget()
+
+        if proto == "auto":
+            self.frm_ips.pack(fill="x")
+            self.frm_doh.pack(fill="x", pady=(5, 0))
+            self.lbl_ips.config(text="IP-адреса серверов (если есть — для :853 или DoH по IP):")
+            self.lbl_ips_hint.config(
+                text="Через запятую, можно ip:порт. Оставьте пустым, если есть только ссылка DoH ниже."
+            )
+            self.lbl_doh.config(text="Ссылка DoH https://... (если есть — для :443 / :8443):")
+            self.lbl_doh_hint.config(
+                text="Оставьте пустым, если есть только IP для DoT :853. Программа сама выберет рабочий порт."
+            )
+            self.mode_opts_frm.pack_forget()
+            return
+
+        if not self.mode_opts_frm.winfo_manager():
+            self.mode_opts_frm.pack(fill="x", padx=16, pady=(4, 0), after=self.frm_conn)
+
         if proto == "doh_url":
             self.frm_doh.pack(fill="x")
+            self.lbl_doh.config(text="URL DoH-сервера (https://...):")
             self.lbl_doh_hint.config(
-                text="Чистый DoH (как в Chrome): IP резолвятся в фоне напрямую в обход 127.0.0.1. "
-                     "При потерях :443 можно дописать :8443."
+                text="Чистый DoH (как в Chrome): IP резолвятся напрямую в обход 127.0.0.1. Можно :8443."
             )
+            self.chk_verify.pack(side="left")
+            self.chk_split_hello.pack(side="left", padx=(16, 0))
         elif proto == "doh":
             self.frm_ips.pack(fill="x")
-            self.frm_doh.pack(fill="x", pady=(6, 0))
+            self.frm_doh.pack(fill="x", pady=(5, 0))
             self.lbl_ips.config(text="IP DoH-сервера (прямой коннект без DNS-резолва):")
             self.lbl_ips_hint.config(
                 text="Каждый IP балансируется отдельно (Keep-Alive). Пусто — резолвим IP из URL сами."
             )
+            self.lbl_doh.config(text="URL DoH-сервера (https://...):")
             self.lbl_doh_hint.config(
-                text="В РФ при потерях :443 допишите порт: https://домен:8443/dns-query"
+                text="При потерях :443 у провайдера допишите порт: https://домен:8443/dns-query"
             )
+            self.chk_verify.pack(side="left")
+            self.chk_split_hello.pack(side="left", padx=(16, 0))
         else:
             self.frm_ips.pack(fill="x")
-            self.frm_sni.pack(fill="x", pady=(6, 0))
-            self.lbl_ips.config(text="Ваши DNS-серверы (IP через запятую — любые):")
+            self.lbl_ips.config(text="DNS-серверы DoT (IP или IP:порт через запятую):")
             self.lbl_ips_hint.config(
-                text="Порядок важен: при недоступности первого запросы уходят на следующий."
+                text="Порт по умолчанию :853. При недоступности первого запросы уходят на следующий."
             )
+            self.chk_verify.pack(side="left")
+            if self.var_verify.get():
+                self.frm_sni.pack(fill="x", pady=(5, 0))
 
     def _apply_env_status(self, payload: dict):
         self.var_autostart.set(bool(payload.get("autostart", False)))
@@ -3552,14 +4073,14 @@ class App(tk.Tk):
             "split_domains": "\n".join(self.split_domains),
             "direct_dns": self.direct_dns_raw,
             "sni": self.ent_sni.get().strip(),
-            "doh_url": self.ent_doh.get().strip(),
+            "doh_url": _clean_doh_url(self.ent_doh.get()),
         }
 
     def _apply_imported_config(self, cfg: dict):
         self.ent_ips.delete(0, "end")
         if cfg.get("ips"):
             self.ent_ips.insert(0, cfg["ips"])
-        self.var_proto.set(cfg.get("proto", "dot"))
+        self.var_proto.set(cfg.get("proto", "auto"))
         self.var_verify.set(bool(cfg.get("verify", False)))
         self.var_block_v6_quic.set(bool(cfg.get("block_v6_quic", True)))
         self.var_split_hello.set(bool(cfg.get("split_hello", False)))
@@ -3570,9 +4091,10 @@ class App(tk.Tk):
         self.ent_sni.delete(0, "end")
         if cfg.get("sni"):
             self.ent_sni.insert(0, cfg["sni"])
-        if cfg.get("doh_url"):
-            self.ent_doh.delete(0, "end")
-            self.ent_doh.insert(0, cfg["doh_url"])
+        self.ent_doh.delete(0, "end")
+        clean_doh = _clean_doh_url(str(cfg.get("doh_url") or ""))
+        if clean_doh:
+            self.ent_doh.insert(0, clean_doh)
         self._update_split_btn_text()
         self._on_proto()
         self._save_config()
@@ -3581,19 +4103,13 @@ class App(tk.Tk):
         cfg = self._current_cfg_dict()
         cfg["split_domains"] = list(self.split_domains)
         link = export_config_link(cfg)
-        self.clipboard_clear()
-        self.clipboard_append(link)
-        self.update()
+        _clipboard_set(self, link)
         self.log(f"✔ Конфиг скопирован в буфер ({len(link)} симв.): можно скидывать в чат.")
 
     def on_paste_config(self):
         if self._busy:
             return
-        clip = ""
-        try:
-            clip = str(self.clipboard_get() or "").strip()
-        except tk.TclError:
-            clip = ""
+        clip = _clipboard_get(self).strip()
 
         if clip.lower().startswith("securedns://") or (clip.startswith("{") and "proto" in clip):
             try:
@@ -3602,11 +4118,39 @@ class App(tk.Tk):
                 self.log(f"✔ Настройки загружены из буфера (режим {cfg['proto']}, "
                          f"раздельный DNS: {'вкл' if cfg['split_dns'] else 'выкл'}).")
                 if self.proxy is not None:
-                    self.log("ℹ Для применения новых настроек нажмите «Отключить» → «Включить».")
+                    self.log("ℹ Для применения новых настроек нажмите «Включить» для перезапуска.")
                 return
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror(APP_NAME, f"Ошибка разбора конфига из буфера:\n{e}")
                 return
+
+        if clip.lower().startswith("https://") and len(clip.split()) == 1:
+            self.ent_doh.delete(0, "end")
+            self.ent_doh.insert(0, clip)
+            cur_ips = self.ent_ips.get().strip()
+            if self.var_proto.get() == "dot":
+                self.var_proto.set("doh" if cur_ips else "doh_url")
+            self.var_verify.set(True)
+            self._on_proto()
+            self._save_config()
+            self.log(f"✔ DoH-ссылка подставлена из буфера: {clip}")
+            return
+
+        if clip and not any(c.isalpha() for c in clip.replace("tls://", "").replace("dot://", "")):
+            try:
+                parsed_ips = parse_ip_targets(clip)
+                if parsed_ips:
+                    fmt = format_ip_targets(parsed_ips)
+                    self.ent_ips.delete(0, "end")
+                    self.ent_ips.insert(0, fmt)
+                    if self.var_proto.get() == "doh_url":
+                        self.var_proto.set("auto")
+                    self._on_proto()
+                    self._save_config()
+                    self.log(f"✔ IP-адреса подставлены из буфера: {fmt}")
+                    return
+            except ValueError:
+                pass
 
         win = tk.Toplevel(self)
         win.title("Вставить настройки (securedns://...)")
@@ -3700,9 +4244,7 @@ class App(tk.Tk):
         bar.pack(fill="x", padx=14, pady=(0, 12))
 
         def copy_guide():
-            self.clipboard_clear()
-            self.clipboard_append(format_beginner_guide())
-            self.update_idletasks()
+            _clipboard_set(self, format_beginner_guide())
             self.log("✔ Инструкция скопирована в буфер обмена.")
 
         ttk.Button(bar, text="Скопировать инструкцию", command=copy_guide).pack(side="left")
@@ -3778,51 +4320,133 @@ class App(tk.Tk):
         return self.adapters[i] if 0 <= i < len(self.adapters) else None
 
     def _parse_ips(self):
-        ips = [s.strip() for s in self.ent_ips.get().split(",") if s.strip()]
-        for ip in ips:
-            if not _valid_ip(ip):
-                return None
-        return ips
+        try:
+            return [ip for ip, _ in parse_ip_targets(self.ent_ips.get())]
+        except ValueError:
+            return None
+
+    def _parse_targets(self):
+        try:
+            return parse_ip_targets(self.ent_ips.get())
+        except ValueError:
+            return None
+
+    def _maybe_offer_doh_redirect(self, raw_text: str, from_field: str) -> bool:
+        url = _extract_https_url(raw_text)
+        if not url:
+            return False
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Похоже, вы вставили DoH-ссылку в поле {from_field}:\n{url}\n\n"
+            f"Перенести её в поле URL DoH и переключить режим на подходящий?",
+        ):
+            return False
+        if from_field == "IP":
+            leftover = [tok for tok in re.split(r"[\s,;]+", self.ent_ips.get().strip()) if tok and tok != url]
+            self.ent_ips.delete(0, "end")
+            if leftover:
+                self.ent_ips.insert(0, ", ".join(leftover))
+        else:
+            self.ent_sni.delete(0, "end")
+        self.ent_doh.delete(0, "end")
+        self.ent_doh.insert(0, url)
+        has_ips = bool(self.ent_ips.get().strip())
+        if self.var_proto.get() == "dot":
+            self.var_proto.set("doh" if has_ips else "doh_url")
+            self.var_verify.set(True)
+        self._on_proto()
+        self._save_config()
+        return True
 
     def _build_upstreams(self):
         proto = self.var_proto.get()
-        verify = self.var_verify.get()
-        split_hello = self.var_split_hello.get()
+        verify = bool(self.var_verify.get())
+        split_hello = bool(self.var_split_hello.get())
         split_tag = " + TLS-резка 3B" if split_hello else ""
+
+        if proto == "auto":
+            if self._maybe_offer_doh_redirect(self.ent_ips.get(), "IP"):
+                proto = self.var_proto.get()
+            else:
+                targets = self._parse_targets()
+                if targets is None:
+                    messagebox.showerror(
+                        APP_NAME,
+                        "Некорректный формат IP-адресов.\n"
+                        "Пример: 77.90.47.223 или 77.90.47.223:853 через запятую.",
+                    )
+                    return None
+                clean_url = _clean_doh_url(self.ent_doh.get())
+                raw_url = self.ent_doh.get().strip()
+                if raw_url and not clean_url:
+                    clean_url = ""
+                if clean_url and not clean_url.lower().startswith("https://"):
+                    messagebox.showerror(APP_NAME, "DoH-ссылка должна начинаться с https://")
+                    return None
+                if not targets and not clean_url:
+                    messagebox.showerror(
+                        APP_NAME,
+                        "Для режима «Авто» впишите IP-адрес сервера и/или ссылку DoH https://...",
+                    )
+                    return None
+                parts = []
+                if targets:
+                    parts.append(format_ip_targets(targets))
+                if clean_url:
+                    parts.append(clean_url)
+                desc = f"Авто ({' + '.join(parts)})"
+                if clean_url:
+                    b_ips = [targets[0][0]] if targets else []
+                    ups = [DoHUpstream(clean_url, verify=True, bootstrap_ips=b_ips, defer_resolve=not bool(b_ips))]
+                else:
+                    ups = [DoTUpstream(ip, port, verify=False) for ip, port in targets]
+                return ups, desc
+
         if proto == "dot":
-            ips = self._parse_ips()
-            if ips is None:
-                messagebox.showerror(APP_NAME, "Впишите корректные IPv4-адреса (не 127.0.0.1 и не 0.0.0.0),\n"
-                                               "например: 9.9.9.9, 149.112.112.112")
+            if self._maybe_offer_doh_redirect(self.ent_ips.get(), "IP"):
+                return self._build_upstreams()
+            if verify and self._maybe_offer_doh_redirect(self.ent_sni.get(), "SNI"):
+                return self._build_upstreams()
+            targets = self._parse_targets()
+            if targets is None:
+                messagebox.showerror(
+                    APP_NAME,
+                    "Впишите корректные IPv4-адреса (или IP:порт) через запятую,\n"
+                    "например: 9.9.9.9, 149.112.112.112:853",
+                )
                 return None
-            if not ips:
+            if not targets:
                 messagebox.showerror(APP_NAME, "Для DoT впишите хотя бы один IP сервера.")
                 return None
             sni = _clean_sni_host(self.ent_sni.get())
             if verify and not sni:
-                if not messagebox.askyesno(
+                if messagebox.askyesno(
                         APP_NAME,
-                        "Включена проверка сертификата, но «Домен сертификата» не задан.\n"
-                        "Сертификат сервера обычно выпущен на домен, а не на IP —\n"
-                        "проверка, скорее всего, не пройдёт (IP address mismatch).\n\n"
-                        "Продолжить без домена?"):
+                        "Включена проверка TLS-сертификата, но домен SNI не задан.\n"
+                        "Сертификат обычно выпущен на домен, поэтому по голому IP проверка не пройдёт.\n\n"
+                        "Отключить проверку сертификата и продолжить?"):
+                    verify = False
+                    self.var_verify.set(False)
+                    self._on_proto()
+                elif not messagebox.askyesno(APP_NAME, "Всё равно запустить со строгой проверкой без домена?"):
                     return None
-            return [DoTUpstream(ip, 853, verify=verify, hostname=sni, split_hello=split_hello) for ip in ips], \
-                   f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "") + split_tag
+            return [DoTUpstream(ip, port, verify=verify, hostname=sni) for ip, port in targets], \
+                   f"DoT → {format_ip_targets(targets)}" + (f" (SNI {sni})" if sni else "")
 
-        url = self.ent_doh.get().strip()
-        if not url.startswith("https://"):
-            messagebox.showerror(APP_NAME, "DoH-шаблон должен начинаться с https://")
+        url = _clean_doh_url(self.ent_doh.get())
+        if not url.lower().startswith("https://"):
+            messagebox.showerror(APP_NAME, "Впишите реальную ссылку DoH-сервера, начинающуюся с https://")
             return None
         if proto == "doh_url":
             desc = f"DoH (URL) → {url}" + split_tag
             return [DoHUpstream(url, verify=verify, bootstrap_ips=[], split_hello=split_hello, defer_resolve=True)], desc
 
-        ips = self._parse_ips()
-        if ips is None:
+        targets = self._parse_targets()
+        if targets is None:
             messagebox.showerror(APP_NAME, "Впишите корректные IPv4-адреса (не 127.0.0.1 и не 0.0.0.0),\n"
-                                           "или выберите режим «DoH (как в Chrome)».")
+                                           "или выберите режим «DoH по URL (как в Chrome)».")
             return None
+        ips = [ip for ip, _ in targets]
         desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else " (резолв из URL)") + split_tag
         if ips:
             return [DoHUpstream(url, verify=verify, bootstrap_ips=[ip], split_hello=split_hello) for ip in ips], desc
@@ -3925,7 +4549,7 @@ class App(tk.Tk):
             ips = cfg.get("ips", "")
             if ips:
                 self.ent_ips.insert(0, ips)
-            self.var_proto.set(cfg.get("proto", "dot"))
+            self.var_proto.set(cfg.get("proto", "auto"))
             self.var_verify.set(bool(cfg.get("verify", False)))
             self.var_block_v6_quic.set(bool(cfg.get("block_v6_quic", True)))
             self.var_split_hello.set(bool(cfg.get("split_hello", False)))
@@ -3940,9 +4564,10 @@ class App(tk.Tk):
             if cfg.get("sni"):
                 self.ent_sni.delete(0, "end")
                 self.ent_sni.insert(0, cfg["sni"])
-            if cfg.get("doh_url"):
-                self.ent_doh.delete(0, "end")
-                self.ent_doh.insert(0, cfg["doh_url"])
+            clean_doh = _clean_doh_url(str(cfg.get("doh_url") or ""))
+            self.ent_doh.delete(0, "end")
+            if clean_doh:
+                self.ent_doh.insert(0, clean_doh)
         except (OSError, json.JSONDecodeError):
             self.split_domains = list(DEFAULT_SPLIT_DOMAINS)
             self.direct_dns_raw = ""
@@ -4000,6 +4625,21 @@ class App(tk.Tk):
                 text="DNS адаптера: " + (", ".join(all_dns) if all_dns else "автоматически (DHCP)"),
                 foreground=MUTED)
 
+    def _update_live_stats(self):
+        if not self.proxy:
+            self.lbl_stats.config(text="Счётчики: ожидание запуска", foreground=MUTED)
+            return
+        st = self.proxy.get_stats()
+        s = st.get("stats") or {}
+        self.lbl_stats.config(
+            text=(
+                f"Запросов: {s.get('total', 0)} | Кэш: {s.get('cache_hit', 0)} "
+                f"({st.get('cache_entries', 0)} зап.) | Блок v6/QUIC: {s.get('blocked_v6_quic', 0)} | "
+                f"Ошибок: {s.get('err', 0)}"
+            ),
+            foreground=MUTED,
+        )
+
     def _apply_proxy_state(self, _):
         if self.proxy:
             v6_txt = " + ::1:53" if self.proxy.ipv6_bound else ""
@@ -4009,6 +4649,40 @@ class App(tk.Tk):
                                   foreground=GREEN)
         else:
             self.lbl_proxy.config(text="Прокси: остановлен", foreground=MUTED)
+        self._update_live_stats()
+
+    def on_flush_cache(self):
+        if self.proxy:
+            self.proxy.clear_cache()
+        flush_dns_cache()
+        self._update_live_stats()
+        self.log("✔ Кэш DNS (прокси + система) очищен.")
+
+    def on_clear_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    def _on_offer_switch_doh(self, payload: dict):
+        title = payload.get("label") or "DoH"
+        url = payload.get("url") or ""
+        split = bool(payload.get("split", False))
+        has_ips = bool(self.ent_ips.get().strip())
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Порт 853 не отвечает, но ваш сервер ответил по {title}.\n\n"
+            f"Переключиться на рабочий режим и запустить шифрованный DNS прямо сейчас?",
+        ):
+            return
+        if url:
+            self.ent_doh.delete(0, "end")
+            self.ent_doh.insert(0, url)
+        self.var_proto.set("doh" if has_ips else "doh_url")
+        self.var_verify.set(True)
+        self.var_split_hello.set(split)
+        self._on_proto()
+        self._save_config()
+        self.on_enable()
 
     # ---------- действия ----------
     def on_enable(self):
@@ -4043,7 +4717,9 @@ class App(tk.Tk):
             return
         upstreams, desc = built
         proto = self.var_proto.get()
-        doh_url = self.ent_doh.get().strip()
+        targets = self._parse_targets() or []
+        doh_url = _clean_doh_url(self.ent_doh.get())
+        sni = _clean_sni_host(self.ent_sni.get()) if proto == "dot" else None
         verify = bool(self.var_verify.get())
         split_hello = bool(self.var_split_hello.get())
         block_v6_quic = self.var_block_v6_quic.get()
@@ -4055,45 +4731,77 @@ class App(tk.Tk):
             nonlocal upstreams
             self.q.put(("log", f"▶ Включаю шифрованный DNS ({desc}) на «{a['name']}»…"))
             k = adapter_key(a)
+            pre_v4 = get_dns_servers(k)
+            direct_cand = [ip for ip in (pre_v4 + load_backup(k)) if _valid_ip(ip)]
 
-            # 0a. Если выбран чистый DoH по URL без явных IP — резолвим IP в фоне напрямую
-            if proto in ("doh_url", "doh") and any(not getattr(up, "_ips", None) for up in upstreams):
+            if proto == "auto":
                 for up in upstreams:
                     up.close()
-                pre_v4 = get_dns_servers(k)
-                direct_cand = [ip for ip in (pre_v4 + load_backup(k)) if _valid_ip(ip)]
-                upstreams, resolved_ips = expand_doh_upstreams(
-                    doh_url, verify, split_hello, ips=[], direct_dns_ips=direct_cand
-                )
-                if not resolved_ips:
+                try:
+                    upstreams, win_desc, probe_rows = resolve_auto_upstreams(
+                        targets, doh_url=doh_url, direct_dns_ips=direct_cand, verify_dot=True
+                    )
+                except Exception as e:  # noqa: BLE001
+                    self.q.put(("log", f"   ✘ Автоподбор не нашёл рабочий канал: {e}"))
+                    self.q.put(("log", "   Настройки НЕ применены."))
+                    return
+                for lbl, _ok, detail in probe_rows:
+                    self.q.put(("log", f"   {lbl}: {detail}"))
+                self.q.put(("log", f"   ✔ Выбран рабочий канал: {win_desc}"))
+            else:
+                # 0a. Если выбран DoH без явных IP — резолвим IP в фоне напрямую
+                if proto in ("doh_url", "doh") and any(not getattr(up, "_ips", None) for up in upstreams):
                     for up in upstreams:
                         up.close()
-                    self.q.put(("log", "   ✘ Не удалось определить IP для DoH-домена. Проверьте ссылку и интернет."))
-                    return
-                self.q.put(("log", f"   ✔ Домен DoH → {', '.join(resolved_ips)}"))
+                    upstreams, resolved_ips = expand_doh_upstreams(
+                        doh_url, verify, split_hello, ips=[], direct_dns_ips=direct_cand
+                    )
+                    if not resolved_ips:
+                        for up in upstreams:
+                            up.close()
+                        self.q.put(("log", "   ✘ Не удалось определить IP для DoH-домена. Проверьте ссылку и интернет."))
+                        return
+                    self.q.put(("log", f"   ✔ Домен DoH → {', '.join(resolved_ips)}"))
 
-            # 0b. Проверяем, что хотя бы один апстрим реально отвечает
-            test = build_dns_query("example.com")
-            ok_up = False
-            last_err = None
-            for idx, up in enumerate(upstreams, 1):
-                try:
-                    resp = up.query(test)
-                    ips = parse_answers(resp)
-                    self.q.put(("log", f"   ✔ Апстрим #{idx} отвечает: example.com → "
-                                       f"{', '.join(ips) or 'ответ получен'}"))
-                    ok_up = True
-                    break
-                except Exception as e:  # noqa: BLE001
-                    last_err = e
-                    self.q.put(("log", f"   ⚠ Апстрим #{idx} не ответил: {e}"))
-            if not ok_up:
-                for up in upstreams:
-                    up.close()
-                self.q.put(("log", f"   ✘ Ни один апстрим НЕ отвечает: {last_err}"))
-                self.q.put(("log", "   Проверьте IP, протокол и галочку проверки "
-                                   "сертификата. Настройки НЕ применены."))
-                return
+                # 0b. Проверяем, что хотя бы один апстрим реально отвечает
+                test = build_dns_query("example.com")
+                ok_up = False
+                last_err = None
+                for idx, up in enumerate(upstreams, 1):
+                    try:
+                        resp = up.query(test)
+                        ips = parse_answers(resp)
+                        self.q.put(("log", f"   ✔ Апстрим #{idx} отвечает: example.com → "
+                                           f"{', '.join(ips) or 'ответ получен'}"))
+                        ok_up = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_err = e
+                        self.q.put(("log", f"   ⚠ Апстрим #{idx} не ответил: {e}"))
+                if not ok_up:
+                    for up in upstreams:
+                        up.close()
+                    self.q.put(("log", f"   ✘ Ни один апстрим НЕ отвечает: {last_err}"))
+                    if proto == "dot":
+                        self.q.put(("log", "   Проверяю альтернативные порты (:443 / резка 3B / :8443)…"))
+                        alt_rows = probe_transports(
+                            [ip for ip, _ in targets[:2]],
+                            doh_url=doh_url,
+                            sni=sni or (_clean_sni_host(doh_url) if doh_url else None),
+                            verify=verify or bool(doh_url),
+                            direct_dns_ips=direct_cand,
+                        )
+                        offer = None
+                        for lbl, ok, detail in alt_rows:
+                            if not lbl.startswith("DoT "):
+                                self.q.put(("log", f"   {lbl}: {detail}"))
+                                if ok and doh_url and offer is None and lbl.startswith("DoH "):
+                                    sw_url = _with_url_port(doh_url, 8443) if ":8443" in lbl else doh_url
+                                    offer = {"label": lbl, "url": sw_url, "split": "резка 3B" in lbl}
+                        if offer is not None:
+                            self.q.put(("offer_switch_doh", offer))
+                    self.q.put(("log", "   Настройки НЕ применены."))
+                    return
 
             # 1. Если защита была включена на другом адаптере — откатим его DNS
             if prev_active and adapter_key(prev_active) != adapter_key(a):
@@ -4244,14 +4952,15 @@ class App(tk.Tk):
 
     def on_probe_ports(self):
         proto = self.var_proto.get()
-        ips = [] if proto == "doh_url" else (self._parse_ips() or [])
-        doh_url = self.ent_doh.get().strip() if proto in ("doh", "doh_url") else ""
+        targets = [] if proto == "doh_url" else (self._parse_targets() or [])
+        ips = [ip for ip, _ in targets]
+        doh_url = _clean_doh_url(self.ent_doh.get()) if proto in ("auto", "doh", "doh_url") else ""
         sni = _clean_sni_host(self.ent_sni.get()) if proto == "dot" else None
-        verify = bool(self.var_verify.get())
+        verify = (True if doh_url else False) if proto == "auto" else bool(self.var_verify.get())
         sel = self._selected_adapter()
 
         if not ips and not (doh_url and doh_url.startswith("https://")):
-            messagebox.showerror(APP_NAME, "Впишите IP сервера (или URL в режиме DoH) для теста портов.")
+            messagebox.showerror(APP_NAME, "Впишите IP сервера и/или URL DoH для теста портов.")
             return
 
         def work():
@@ -4278,25 +4987,31 @@ class App(tk.Tk):
                         s.settimeout(8)
                         if self.proxy.split_enabled and self.proxy.split_domains:
                             ai_host = self.proxy.split_domains[0]
+                            t0 = time.monotonic()
                             s.sendto(build_dns_query(ai_host), (LOCAL_DNS, 53))
                             r_ai, _ = s.recvfrom(4096)
+                            ms_ai = int((time.monotonic() - t0) * 1000)
                             self.q.put(("log", f"   127.0.0.1:53 → {ai_host} = "
-                                               f"{', '.join(parse_answers(r_ai)) or 'ответ без A-записей'} [SmartDNS ✔]"))
+                                               f"{', '.join(parse_answers(r_ai)) or 'ответ без A-записей'} ({ms_ai} мс) [SmartDNS ✔]"))
                             dir_host = ("example.org"
                                         if self.proxy._is_smart_domain("example.com")
                                         else "example.com")
+                            t1 = time.monotonic()
                             s.sendto(build_dns_query(dir_host), (LOCAL_DNS, 53))
                             r_dir, _ = s.recvfrom(4096)
+                            ms_dir = int((time.monotonic() - t1) * 1000)
                             self.q.put(("log", f"   127.0.0.1:53 → {dir_host} = "
-                                               f"{', '.join(parse_answers(r_dir)) or 'ответ без A-записей'} [Провайдер ✔]"))
+                                               f"{', '.join(parse_answers(r_dir)) or 'ответ без A-записей'} ({ms_dir} мс) [Провайдер ✔]"))
                             self.q.put(("log", "✔ Раздельный DNS работает: список ИИ идёт через шифрованный "
                                                "сервер, остальное — через провайдера."))
                         else:
+                            t0 = time.monotonic()
                             s.sendto(build_dns_query("example.com"), (LOCAL_DNS, 53))
                             resp, _ = s.recvfrom(4096)
+                            ms = int((time.monotonic() - t0) * 1000)
                             ips = parse_answers(resp)
                             self.q.put(("log", f"   127.0.0.1:53 → example.com = "
-                                               f"{', '.join(ips) or 'ответ без A-записей'}"))
+                                               f"{', '.join(ips) or 'ответ без A-записей'} ({ms} мс)"))
                             self.q.put(("log", "✔ Шифрованный канал работает: запрос ушёл "
                                                "по TLS на ваш сервер и вернулся с ответом."))
                 except Exception as e:  # noqa: BLE001
@@ -4309,7 +5024,8 @@ class App(tk.Tk):
             return
         upstreams, desc = built
         proto = self.var_proto.get()
-        doh_url = self.ent_doh.get().strip()
+        targets = self._parse_targets() or []
+        doh_url = _clean_doh_url(self.ent_doh.get())
         verify = bool(self.var_verify.get())
         split_hello = bool(self.var_split_hello.get())
         sel = self._selected_adapter()
@@ -4317,13 +5033,28 @@ class App(tk.Tk):
         def work_upstream():
             nonlocal upstreams
             self.q.put(("log", "▶ Проверка…"))
+            cand_dns = []
+            if sel:
+                k = adapter_key(sel)
+                cand_dns = [x for x in (get_dns_servers(k) + load_backup(k)) if _valid_ip(x)]
+            if proto == "auto":
+                for up in upstreams:
+                    up.close()
+                try:
+                    test_ups, win_desc, probe_rows = resolve_auto_upstreams(
+                        targets, doh_url=doh_url, direct_dns_ips=cand_dns, verify_dot=True
+                    )
+                    for up in test_ups:
+                        up.close()
+                    for lbl, _ok, detail in probe_rows:
+                        self.q.put(("log", f"   {lbl}: {detail}"))
+                    self.q.put(("log", f"✔ Рабочий транспорт найден ({win_desc}) — можно нажимать «Включить»."))
+                except Exception as e:  # noqa: BLE001
+                    self.q.put(("log", f"✘ Автопроверка не прошла: {e}"))
+                return
             if proto in ("doh_url", "doh") and any(not getattr(up, "_ips", None) for up in upstreams):
                 for up in upstreams:
                     up.close()
-                cand_dns = []
-                if sel:
-                    k = adapter_key(sel)
-                    cand_dns = [x for x in (get_dns_servers(k) + load_backup(k)) if _valid_ip(x)]
                 upstreams, resolved_ips = expand_doh_upstreams(
                     doh_url, verify, split_hello, ips=[], direct_dns_ips=cand_dns
                 )
@@ -4336,10 +5067,12 @@ class App(tk.Tk):
             try:
                 for idx, up in enumerate(upstreams, 1):
                     try:
+                        t0 = time.monotonic()
                         resp = up.query(q)
+                        ms = int((time.monotonic() - t0) * 1000)
                         ips = parse_answers(resp)
                         self.q.put(("log", f"   ✔ Апстрим #{idx} отвечает: example.com → "
-                                           f"{', '.join(ips) or 'ответ получен'}"))
+                                           f"{', '.join(ips) or 'ответ получен'} ({ms} мс)"))
                         ok_any = True
                         break
                     except Exception as e:  # noqa: BLE001
@@ -4464,41 +5197,65 @@ def _cli_build_upstreams():
     Опечатки переспрашиваем, пустой ввод — отмена."""
     while True:
         proto = _cli_input(
-            "Режим: dot (порт 853, рекомендуется для РФ), doh_url (чистый DoH по ссылке без IP), doh (URL + IP)",
-            "dot",
+            "Режим: auto (подберёт сам), dot (:853), doh_url (DoH по ссылке), doh (URL + IP)",
+            "auto",
         ).lower()
-        if proto in ("dot", "doh", "doh_url"):
+        if proto in ("auto", "dot", "doh", "doh_url"):
             break
-        print("✘ Впишите «dot», «doh_url» или «doh».")
+        print("✘ Впишите «auto», «dot», «doh_url» или «doh».")
 
-    ips = []
+    if proto == "auto":
+        while True:
+            raw_ips = _cli_input("IP-адреса сервера (через запятую, можно пусто если есть ссылка)", "")
+            try:
+                targets = parse_ip_targets(raw_ips) if raw_ips else []
+                break
+            except ValueError as e:
+                print(f"✘ {e}")
+        while True:
+            raw_url = _cli_input("DoH URL https://... (или пусто, если только IP для :853)", "")
+            if not raw_url or raw_url.lower().startswith("https://"):
+                break
+            print("✘ URL должен начинаться с https://")
+        if not targets and not raw_url:
+            return None
+        try:
+            ups, win_desc, rows = resolve_auto_upstreams(targets, doh_url=raw_url, verify_dot=True)
+            for lbl, _ok, detail in rows:
+                print(f"  {lbl}: {detail}")
+            return ups, win_desc
+        except Exception as e:  # noqa: BLE001
+            print(f"✘ {e}")
+            return None
+
+    targets = []
     if proto in ("dot", "doh"):
         while True:
-            raw = _cli_input("Ваши DNS-серверы (IP через запятую; для doh можно пусто — резолвим из URL)")
+            raw = _cli_input("Ваши DNS-серверы (IP или IP:порт через запятую; для doh можно пусто)")
             if not raw:
                 if proto == "dot":
                     return None
-                ips = []
+                targets = []
                 break
-            ips = [s.strip() for s in raw.split(",") if s.strip()]
-            bad = [ip for ip in ips if not _valid_ip(ip)]
-            if ips and not bad:
-                break
-            print(f"✘ Некорректные адреса: {', '.join(bad) or raw}. "
-                  f"Пример: 9.9.9.9, 149.112.112.112")
+            try:
+                targets = parse_ip_targets(raw)
+                if targets:
+                    break
+            except ValueError as e:
+                print(f"✘ {e}. Пример: 9.9.9.9, 149.112.112.112:853")
 
+    ips = [ip for ip, _ in targets]
     default_verify = "y" if proto == "doh_url" else "n"
     verify = _cli_input("Проверять TLS-сертификат сервера? (y/n)", default_verify).lower() == "y"
-    split_hello = _cli_input("Резать TLS ClientHello по 3 байта принудительно (обход ТСПУ для :443)? (y/n)", "n").lower() == "y"
-    split_tag = " + TLS-резка 3B" if split_hello else ""
     if proto == "dot":
         sni = None
         if verify:
-            raw_sni = _cli_input("Домен сертификата для проверки (сертификат обычно "
-                                 "выпущен на домен, а не на IP; пусто — проверять по IP)")
+            raw_sni = _cli_input("Домен сертификата для проверки (пусто — проверять по IP)")
             sni = _clean_sni_host(raw_sni)
-        return [DoTUpstream(ip, 853, verify=verify, hostname=sni, split_hello=split_hello) for ip in ips], \
-               f"DoT:853 → {', '.join(ips)}" + (f" (SNI {sni})" if sni else "") + split_tag
+        return [DoTUpstream(ip, port, verify=verify, hostname=sni) for ip, port in targets], \
+               f"DoT → {format_ip_targets(targets)}" + (f" (SNI {sni})" if sni else "")
+    split_hello = _cli_input("Резать TLS ClientHello по 3 байта (:443)? (y/n)", "n").lower() == "y"
+    split_tag = " + TLS-резка 3B" if split_hello else ""
     while True:
         url = _cli_input("DoH-шаблон (https://... или https://домен:8443/dns-query, пусто — отмена)")
         if not url:
@@ -4558,6 +5315,13 @@ def cli_main():
                 mark = " ← через SecureDNS" if dns == [LOCAL_DNS] else ""
                 print(f"  {a['name']} ({a['desc']}): {', '.join(dns) or 'авто (DHCP)'}{mark}")
             print(f"  Прокси: {'работает на 127.0.0.1:53' if proxy else 'остановлен'}")
+            if proxy:
+                st = proxy.get_stats()
+                s = st.get("stats") or {}
+                print(
+                    f"  Счётчики: запросов={s.get('total', 0)}, кэш={s.get('cache_hit', 0)} "
+                    f"({st.get('cache_entries', 0)} зап.), блок v6/QUIC={s.get('blocked_v6_quic', 0)}, ошибок={s.get('err', 0)}"
+                )
 
         def enable():
             nonlocal proxy, active
