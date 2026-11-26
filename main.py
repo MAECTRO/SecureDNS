@@ -48,7 +48,7 @@ except ImportError:
     winreg = None
 
 APP_NAME = "SecureDNS"
-APP_VERSION = "1.3.6.1"
+APP_VERSION = "1.3.6.2"
 DEFAULT_DOH_PLACEHOLDER = "https://example.com/dns-query"
 IS_WINDOWS = sys.platform.startswith("win")
 SPAWN_KW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
@@ -422,12 +422,18 @@ def set_dns_servers(adapter, servers):
         )
         if rc != 0 and any(":" in s for s in servers_list):
             v4_only = [s for s in servers_list if ":" not in s]
+            v6_only = [s for s in servers_list if ":" in s]
             if v4_only:
                 rc4, _, err4 = run_ps(
                     "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
                         adapter, ",".join('"%s"' % s for s in v4_only))
                 )
                 if rc4 == 0:
+                    if v6_only:
+                        run_ps(
+                            "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses ({})".format(
+                                adapter, ",".join('"%s"' % s for s in v6_only))
+                        )
                     return True, ""
                 return False, (err4 or err).strip()
         return rc == 0, err.strip()
@@ -542,7 +548,11 @@ _BROWSER_DOH_POLICY_KEYS = (
     ("Chrome", r"SOFTWARE\Policies\Google\Chrome"),
     ("Edge", r"SOFTWARE\Policies\Microsoft\Edge"),
     ("Yandex", r"SOFTWARE\Policies\YandexBrowser"),
+    ("Brave", r"SOFTWARE\Policies\BraveSoftware\Brave"),
+    ("Vivaldi", r"SOFTWARE\Policies\Vivaldi"),
+    ("Opera", r"SOFTWARE\Policies\Opera Software"),
 )
+_FIREFOX_DOH_POLICY_KEY = r"SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
 
 
 def check_browser_doh_status() -> dict:
@@ -567,11 +577,23 @@ def check_browser_doh_status() -> dict:
             pass
         policies[name] = val
 
+    ff_val = None
+    try:
+        with winreg.OpenKeyEx(
+            winreg.HKEY_LOCAL_MACHINE, _FIREFOX_DOH_POLICY_KEY, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        ) as k:
+            ff_val, _ = winreg.QueryValueEx(k, "Enabled")
+    except OSError:
+        pass
+    policies["Firefox"] = ff_val
+
     local_app = os.environ.get("LOCALAPPDATA", "")
     local_state_paths = {
         "Chrome": os.path.join(local_app, "Google", "Chrome", "User Data", "Local State"),
         "Edge": os.path.join(local_app, "Microsoft", "Edge", "User Data", "Local State"),
         "Yandex": os.path.join(local_app, "Yandex", "YandexBrowser", "User Data", "Local State"),
+        "Brave": os.path.join(local_app, "BraveSoftware", "Brave-Browser", "User Data", "Local State"),
+        "Vivaldi": os.path.join(local_app, "Vivaldi", "User Data", "Local State"),
     }
     for name, path in local_state_paths.items():
         try:
@@ -584,33 +606,34 @@ def check_browser_doh_status() -> dict:
         except Exception:  # noqa: BLE001
             pass
 
-    chrome_edge_off = all(
-        str(policies.get(b) or "").lower() == "off" for b in ("Chrome", "Edge")
+    all_off = (
+        all(str(policies.get(b) or "").lower() == "off" for b, _ in _BROWSER_DOH_POLICY_KEYS)
+        and policies.get("Firefox") == 0
     )
     active_browser_doh = [
         f"{k}={v}" for k, v in local_modes.items()
         if str(v).lower() in ("automatic", "secure") and str(policies.get(k) or "").lower() != "off"
     ]
-    if chrome_edge_off and not active_browser_doh:
-        summary = "отключён политикой Chrome/Edge (трафик идёт через SecureDNS ✔)"
+    if all_off and not active_browser_doh:
+        summary = "отключён политикой (трафик идёт через SecureDNS ✔)"
         needs_att = False
     elif active_browser_doh:
         summary = f"может обходить через свой DoH ({', '.join(active_browser_doh)})"
         needs_att = True
     else:
-        summary = "политика не задана (если в браузере «Безопасный DNS» включён — пойдёт мимо)"
+        summary = "политика не задана (при включении защиты отключим автоматически)"
         needs_att = True
     return {
         "policies": policies,
         "local_modes": local_modes,
-        "policy_off": chrome_edge_off,
+        "policy_off": all_off,
         "needs_attention": needs_att,
         "summary": summary,
     }
 
 
 def set_browser_doh_policy(disable_browser_doh: bool) -> tuple[bool, str]:
-    """Ставит или снимает политику HKLM DnsOverHttpsMode='off' для Chrome/Edge/Yandex."""
+    """Ставит или снимает политику HKLM отключения встроенного DoH для браузеров."""
     if not IS_WINDOWS or winreg is None:
         return False, "поддерживается только на Windows"
     if not is_admin():
@@ -631,13 +654,27 @@ def set_browser_doh_policy(disable_browser_doh: bool) -> tuple[bool, str]:
                         cur, _ = winreg.QueryValueEx(k, "DnsOverHttpsMode")
                         if str(cur).lower() == "off":
                             winreg.DeleteValue(k, "DnsOverHttpsMode")
-                except FileNotFoundError:
-                    pass
                 except OSError:
                     pass
         if disable_browser_doh:
-            return True, "встроенный DoH в Chrome/Edge/Yandex отключён политикой (перезапустите браузер)"
-        return True, "политика запрета DoH в Chrome/Edge/Yandex удалена"
+            with winreg.CreateKeyEx(
+                winreg.HKEY_LOCAL_MACHINE, _FIREFOX_DOH_POLICY_KEY, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+            ) as k:
+                winreg.SetValueEx(k, "Enabled", 0, winreg.REG_DWORD, 0)
+        else:
+            try:
+                with winreg.OpenKeyEx(
+                    winreg.HKEY_LOCAL_MACHINE, _FIREFOX_DOH_POLICY_KEY, 0,
+                    winreg.KEY_READ | winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+                ) as k:
+                    cur, _ = winreg.QueryValueEx(k, "Enabled")
+                    if cur == 0:
+                        winreg.DeleteValue(k, "Enabled")
+            except OSError:
+                pass
+        if disable_browser_doh:
+            return True, "встроенный DoH браузеров отключён политикой (Chrome/Edge/Yandex/Brave/Opera/Vivaldi/Firefox)"
+        return True, "политика запрета DoH в браузерах снята"
     except OSError as e:
         return False, str(e)
 
@@ -1163,6 +1200,46 @@ def restore_adapter_dns(key):
     return ok, ("DNS возвращён в авто (DHCP)" if ok else f"ошибка: {err}")
 
 
+def _protect_extra_adapters(primary_key, target_dns, log_fn=None) -> list[dict]:
+    """Переводит на 127.0.0.1 прочие активные адаптеры с настроенным DNS (от обхода через них)."""
+    protected = []
+    for extra in get_adapters():
+        ek = adapter_key(extra)
+        if ek == primary_key:
+            continue
+        ev4 = get_dns_servers(ek)
+        ev6 = get_dns_servers_v6(ek)
+        if not ev4 and not ev6:
+            continue
+        save_backup(ek, ev4, ev6)
+        if ev4 == [LOCAL_DNS] and (LOCAL_DNS_V6 not in target_dns or ev6 == [LOCAL_DNS_V6] or not ev6):
+            protected.append(extra)
+            continue
+        ok_e, err_e = set_dns_servers(ek, target_dns)
+        if ok_e:
+            protected.append(extra)
+            if log_fn:
+                log_fn(f"   Доп. адаптер «{extra['name']}» также переведён на {LOCAL_DNS} (защита от утечки DNS).")
+        elif log_fn:
+            log_fn(f"   ⚠ Не удалось перевести доп. адаптер «{extra['name']}»: {err_e}")
+    return protected
+
+
+def _restore_extra_adapters(adapters_list: list[dict], skip_key=None, log_fn=None):
+    """Откатывает DNS на дополнительных адаптерах, защищённых в текущей сессии."""
+    for extra in adapters_list or []:
+        ek = adapter_key(extra)
+        if skip_key is not None and ek == skip_key:
+            continue
+        ok_e, msg_e = restore_adapter_dns(ek)
+        cur4 = get_dns_servers(ek)
+        cur6 = get_dns_servers_v6(ek)
+        if cur4 == [LOCAL_DNS] or cur6 == [LOCAL_DNS_V6]:
+            reset_dns_servers(ek)
+        if log_fn:
+            log_fn(f"   Доп. адаптер «{extra['name']}»: {msg_e}")
+
+
 def startup_rollback(log, should_abort=None):
     """Аварийный откат: если адаптер смотрит на 127.0.0.1 или ::1, а прокси не запущен —
     значит программу закрыли/убили с активной защитой. Возвращаем настройки."""
@@ -1172,6 +1249,11 @@ def startup_rollback(log, should_abort=None):
         if not (should_abort and should_abort()) and is_admin():
             ok_fw, msg_fw = set_quic_firewall_block(False)
             log(f"⚠ Обнаружено правило QUIC Firewall от прошлой сессии: {msg_fw}")
+    if IS_WINDOWS and consume_browser_doh_auto_marker():
+        if not (should_abort and should_abort()) and is_admin():
+            ok_bd, msg_bd = set_browser_doh_policy(False)
+            if ok_bd:
+                log(f"⚠ Восстановлена настройка DoH браузеров от прошлой сессии ({msg_bd}).")
     for a in get_adapters():
         if should_abort and should_abort():
             return
@@ -1275,6 +1357,46 @@ def load_backup_full(if_index: int) -> tuple[list, list]:
 def load_backup(if_index: int):
     v4, _ = load_backup_full(if_index)
     return v4
+
+
+def save_browser_doh_auto_marker(active: bool):
+    """Запоминает, что политика DoH браузеров была выставлена временно текущей сессией."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        data = {}
+        if os.path.exists(BACKUP_FILE):
+            try:
+                with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        if active:
+            data["__browser_doh_auto__"] = True
+        else:
+            data.pop("__browser_doh_auto__", None)
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def consume_browser_doh_auto_marker() -> bool:
+    """Читает и сбрасывает временный маркер авто-отключения DoH браузеров."""
+    try:
+        if not os.path.exists(BACKUP_FILE):
+            return False
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not data.get("__browser_doh_auto__"):
+            return False
+        data.pop("__browser_doh_auto__", None)
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (OSError, json.JSONDecodeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1469,6 +1591,10 @@ def _connect_tls_smart(ip: str, port: int, ctx: ssl.SSLContext, server_hostname:
     raise last_err
 
 
+POOL_MAX_IDLE_SEC = 20.0
+POOLED_READ_TIMEOUT = 2.0
+
+
 class DoTUpstream:
     """DNS-over-TLS (RFC 7858): пул TLS-соединений на порт 853, кадрирование 2 байта длины."""
 
@@ -1521,7 +1647,7 @@ class DoTUpstream:
                 pass
             return
         try:
-            self._pool.put_nowait(s)
+            self._pool.put_nowait((s, time.monotonic()))
         except queue.Full:
             try:
                 s.close()
@@ -1529,14 +1655,27 @@ class DoTUpstream:
                 pass
 
     def query(self, packet: bytes) -> bytes:
-        # 1. Пробуем переиспользовать сокеты из пула (до 2 попыток на случай протухшего)
-        for _ in range(2):
+        # 1. Пробуем переиспользовать свежие сокеты из пула (короткий таймаут против зависшего сокета)
+        now = time.monotonic()
+        for _ in range(3):
             try:
-                s = self._pool.get_nowait()
+                item = self._pool.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, tuple):
+                s, ts = item
+                if now - ts > POOL_MAX_IDLE_SEC:
+                    try:
+                        s.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+            else:
+                s = item
             try:
+                s.settimeout(min(POOLED_READ_TIMEOUT, self.timeout))
                 resp = self._roundtrip(s, packet)
+                s.settimeout(self.timeout)
                 self._put_sock(s)
                 return resp
             except Exception:  # noqa: BLE001
@@ -1600,6 +1739,7 @@ class DoHUpstream:
         self.timeout = timeout
         self.connect_timeout = min(float(connect_timeout), float(timeout))
         self.split_hello = bool(split_hello)
+        self._effective_split = bool(split_hello)
         self._ctx = make_ssl_context(verify, self.host)
         ips = [ip for ip in (bootstrap_ips or []) if ip]
         if not ips and bootstrap_ip:
@@ -1621,21 +1761,33 @@ class DoHUpstream:
     def _pop_conn(self, ip: str):
         requeue = []
         found = None
+        now = time.monotonic()
         while True:
             try:
-                item_ip, conn = self._pool.get_nowait()
+                item = self._pool.get_nowait()
             except queue.Empty:
                 break
+            if len(item) == 3:
+                item_ip, conn, ts = item
+            else:
+                item_ip, conn = item
+                ts = now
+            if now - ts > POOL_MAX_IDLE_SEC:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             if found is None and item_ip == ip:
                 found = conn
                 break
-            requeue.append((item_ip, conn))
-        for item in requeue:
+            requeue.append((item_ip, conn, ts))
+        for entry in requeue:
             try:
-                self._pool.put_nowait(item)
+                self._pool.put_nowait(entry)
             except queue.Full:
                 try:
-                    item[1].close()
+                    entry[1].close()
                 except Exception:  # noqa: BLE001
                     pass
         return found
@@ -1648,17 +1800,17 @@ class DoHUpstream:
                 pass
             return
         try:
-            self._pool.put_nowait((ip, conn))
+            self._pool.put_nowait((ip, conn, time.monotonic()))
         except queue.Full:
             try:
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
 
-    def _send_over_conn(self, conn: http.client.HTTPSConnection, packet: bytes) -> tuple[bytes, bool, int]:
+    def _send_over_conn(self, conn: http.client.HTTPSConnection, packet: bytes, timeout: float | None = None) -> tuple[bytes, bool, int]:
         host_hdr = self.host if self.port == 443 else f"{self.host}:{self.port}"
         if conn.sock is not None:
-            conn.sock.settimeout(self.timeout)
+            conn.sock.settimeout(self.timeout if timeout is None else timeout)
         conn.request("POST", self.path, body=packet, headers={
             "Host": host_hdr,
             "Content-Type": "application/dns-message",
@@ -1685,13 +1837,14 @@ class DoHUpstream:
         raise IOError(f"DoH {self.host}: {last}")
 
     def _query_via(self, ip: str, packet: bytes) -> bytes:
-        # 1. Пробуем живой Keep-Alive коннект из пула
+        # 1. Пробуем живой Keep-Alive коннект из пула с коротким таймаутом (<= 2 с)
+        pooled_to = min(POOLED_READ_TIMEOUT, self.timeout)
         for _ in range(2):
             conn = self._pop_conn(ip)
             if conn is None:
                 break
             try:
-                body, keep, status = self._send_over_conn(conn, packet)
+                body, keep, status = self._send_over_conn(conn, packet, timeout=pooled_to)
             except Exception:  # noqa: BLE001
                 try:
                     conn.close()
@@ -1703,19 +1856,22 @@ class DoHUpstream:
                     conn.close()
                 except Exception:  # noqa: BLE001
                     pass
-                raise IOError(f"DoH {self.host}: HTTP {status}")
+                # Старое Keep-Alive соединение могло протухнуть (408/502/400) — пробуем свежее
+                continue
             if keep:
                 self._push_conn(ip, conn)
             else:
                 conn.close()
             return body
 
-        # 2. Открываем новое TLS-соединение (с быстрым ретраем и фоллбэком резки для :443)
+        # 2. Открываем новое TLS-соединение (и запоминаем сработавшую резку ClientHello)
         sock = _connect_tls_smart(
             ip, self.port, self._ctx, self.host,
             connect_timeout=self.connect_timeout, io_timeout=self.timeout,
-            split_hello=self.split_hello,
+            split_hello=self._effective_split,
         )
+        if not self._effective_split and isinstance(sock, SplitTLSSocket):
+            self._effective_split = True
         conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout)
         conn.sock = sock
         try:
@@ -1828,6 +1984,29 @@ class PlainUDPUpstream:
         pass
 
 
+def _get_windows_gateway_ips(if_index=None) -> list[str]:
+    """Возвращает IPv4-адрес шлюза по умолчанию в Windows (для прямого UDP-резолва без 127.0.0.1)."""
+    if not IS_WINDOWS:
+        return []
+    target = (
+        f"(Get-NetIPConfiguration -InterfaceIndex {if_index} -ErrorAction SilentlyContinue)"
+        if if_index is not None else
+        "(Get-NetIPConfiguration -ErrorAction SilentlyContinue)"
+    )
+    rc, out, _ = run_ps(f"{target}.IPv4DefaultGateway.NextHop | ConvertTo-Json -Compress", timeout=5)
+    if rc == 0 and out.strip():
+        try:
+            gw_data = json.loads(out)
+            if isinstance(gw_data, str):
+                gw_data = [gw_data]
+            valid_gw = [str(ip).strip() for ip in gw_data if _valid_ip(str(ip).strip())]
+            if valid_gw:
+                return list(dict.fromkeys(valid_gw))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
 def resolve_direct_dns(if_index, pre_old_v4=None, manual_raw: str = "") -> tuple[list[str], str]:
     """Определяет рабочий прямой IPv4 DNS для не-ИИ доменов при раздельном DNS."""
     manual_ips = [s.strip() for s in str(manual_raw or "").split(",") if s.strip()]
@@ -1843,22 +2022,10 @@ def resolve_direct_dns(if_index, pre_old_v4=None, manual_raw: str = "") -> tuple
     if bak_v4:
         return list(dict.fromkeys(bak_v4)), "из бэкапа"
 
-    if IS_WINDOWS and if_index is not None:
-        rc, out, _ = run_ps(
-            f"(Get-NetIPConfiguration -InterfaceIndex {if_index} -ErrorAction SilentlyContinue)"
-            f".IPv4DefaultGateway.NextHop | ConvertTo-Json -Compress",
-            timeout=5,
-        )
-        if rc == 0 and out.strip():
-            try:
-                gw_data = json.loads(out)
-                if isinstance(gw_data, str):
-                    gw_data = [gw_data]
-                valid_gw = [str(ip).strip() for ip in gw_data if _valid_ip(str(ip).strip())]
-                if valid_gw:
-                    return list(dict.fromkeys(valid_gw)), "шлюз роутера"
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if if_index is not None:
+        valid_gw = _get_windows_gateway_ips(if_index)
+        if valid_gw:
+            return valid_gw, "шлюз роутера"
 
     return list(FALLBACK_DIRECT_DNS), "резерв (77.88.8.8)"
 
@@ -1874,12 +2041,16 @@ def resolve_bootstrap_ips(host: str, direct_dns_ips: list[str] | None = None) ->
     except ValueError:
         pass
 
-    # 1. Прямой UDP A-запрос к DNS адаптера/бэкапа (не зависит от того, задан ли 127.0.0.1)
+    # 1. Прямой UDP A-запрос к DNS адаптера/бэкапа/шлюза (не зависит от того, задан ли 127.0.0.1)
     q = build_dns_query(h, qtype=1)
     candidates = []
     for ip in list(direct_dns_ips or []):
         if _valid_ip(ip) and ip not in candidates:
             candidates.append(ip)
+    if not candidates:
+        for ip in _get_windows_gateway_ips():
+            if _valid_ip(ip) and ip not in candidates:
+                candidates.append(ip)
     for dns_ip in candidates:
         try:
             resp = PlainUDPUpstream(dns_ip, timeout=2.0).query(q)
@@ -1910,9 +2081,13 @@ def expand_doh_upstreams(url: str, verify: bool, split_hello: bool,
     if not target_ips and u.hostname:
         target_ips = resolve_bootstrap_ips(u.hostname, direct_dns_ips=direct_dns_ips)
     if target_ips:
+        fast = len(target_ips) > 1
+        to_io = 4.0 if fast else 6.0
+        to_conn = 2.5 if fast else 4.0
         return [
             DoHUpstream(
                 url, verify=verify, bootstrap_ips=[ip],
+                timeout=to_io, connect_timeout=to_conn,
                 split_hello=split_hello, bootstrap_dns_ips=direct_dns_ips,
             )
             for ip in target_ips
@@ -2128,12 +2303,22 @@ def resolve_auto_upstreams(ip_targets: list[tuple[str, int]], doh_url: str = "",
             if not ok:
                 continue
             if kind_or_url == "dot":
-                ups = [DoTUpstream(ip, p, verify=bool(verify_dot), hostname=host) for ip, p in targets]
+                fast = len(targets) > 1
+                ups = [
+                    DoTUpstream(
+                        ip, p, verify=bool(verify_dot), hostname=host,
+                        timeout=(4.0 if fast else 6.0), connect_timeout=(2.5 if fast else 4.0),
+                    )
+                    for ip, p in targets
+                ]
                 desc = f"Авто → DoT:{dot_port} ({format_ip_targets(targets)})"
                 return ups, desc, report_rows
+            fast_doh = len(final_ips) > 1
             ups = [
                 DoHUpstream(
                     kind_or_url, verify=True, bootstrap_ips=[ip],
+                    timeout=(4.0 if fast_doh else 6.0),
+                    connect_timeout=(2.5 if fast_doh else 4.0),
                     split_hello=use_split, bootstrap_dns_ips=direct_dns_ips,
                 )
                 for ip in final_ips
@@ -2574,7 +2759,7 @@ class LocalDNSProxy:
             return None
         tid = packet[:2]
         flags = struct.unpack("!H", packet[2:4])[0]
-        resp_flags = 0x8000 | (flags & 0x0100)  # QR=1, keep RD, RCODE=0 (NOERROR)
+        resp_flags = 0x8080 | (flags & 0x0100)  # QR=1, keep RD, RA=1, RCODE=0 (NOERROR)
         qdcount = struct.unpack("!H", packet[4:6])[0]
         pos = 12
         try:
@@ -3465,8 +3650,8 @@ class App(tk.Tk):
     def __init__(self, autostart: bool = False, enable_tray: bool = True):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION} — шифрованный DNS (DoT/DoH)")
-        self.geometry("740x765")
-        self.minsize(690, 715)
+        self.geometry("740x795")
+        self.minsize(690, 735)
         self.configure(bg=BG)
         self._ico_path = resource_path("icon.ico") if IS_WINDOWS else None
         if IS_WINDOWS and self._ico_path and os.path.exists(self._ico_path):
@@ -3478,6 +3663,10 @@ class App(tk.Tk):
         self.adapters = []
         self.proxy = None
         self.active_adapter = None
+        self.protected_adapters = []
+        self._active_target_dns = [LOCAL_DNS]
+        self._watchdog_busy = False
+        self._watchdog_scheduled = False
         self._busy = False
         self._autostart = bool(autostart)
         self._autostart_done = False
@@ -3631,7 +3820,7 @@ class App(tk.Tk):
         self.lbl_browser_doh.pack(side="left")
         if IS_WINDOWS:
             self.btn_browser_doh = ttk.Button(
-                brow_row, text="Откл. DoH Chrome/Edge", style="Small.TButton",
+                brow_row, text="Откл. DoH браузеров", style="Small.TButton",
                 command=self.on_toggle_browser_doh,
             )
             self.btn_browser_doh.pack(side="right")
@@ -3754,8 +3943,17 @@ class App(tk.Tk):
         if not IS_WINDOWS:
             self.chk_autostart.configure(state="disabled")
 
+        self.var_disable_browser_doh = tk.BooleanVar(value=True)
+        chk_bdoh = ttk.Checkbutton(
+            opts_frm, text="Откл. встроенный DoH браузеров при защите",
+            variable=self.var_disable_browser_doh,
+        )
+        chk_bdoh.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        if not IS_WINDOWS:
+            chk_bdoh.configure(state="disabled")
+
         split_row = ttk.Frame(opts_frm)
-        split_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        split_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
         self.var_split_dns = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             split_row,
@@ -3884,6 +4082,13 @@ class App(tk.Tk):
                     self._maybe_autostart_enable()
                 elif kind == "autostart_retry":
                     self._maybe_autostart_enable(retry=payload)
+                elif kind == "start_watchdog":
+                    self._schedule_watchdog()
+                elif kind == "add_protected_adapter":
+                    if payload and all(adapter_key(x) != adapter_key(payload) for x in self.protected_adapters):
+                        self.protected_adapters.append(payload)
+                elif kind == "watchdog_done":
+                    self._watchdog_busy = False
                 elif kind == "quit":
                     if self.proxy:
                         self.proxy.stop()
@@ -3973,7 +4178,7 @@ class App(tk.Tk):
         self.lbl_browser_doh.config(text=f"Браузеры (DoH): {summary}", foreground=color)
         if self.btn_browser_doh is not None:
             self.btn_browser_doh.configure(
-                text="Вернуть DoH браузерам" if bdoh.get("policy_off") else "Откл. DoH Chrome/Edge"
+                text="Вернуть DoH браузерам" if bdoh.get("policy_off") else "Откл. DoH браузеров"
             )
 
     def _maybe_autostart_enable(self, retry: int = 0):
@@ -4051,6 +4256,7 @@ class App(tk.Tk):
                 return
         ok, msg = set_browser_doh_policy(target_off)
         if ok:
+            save_browser_doh_auto_marker(False)
             self.log(f"✔ {msg}")
         else:
             self.log(f"✘ Политика браузеров: {msg}")
@@ -4069,6 +4275,7 @@ class App(tk.Tk):
             "split_hello": bool(self.var_split_hello.get()),
             "block_fw_quic": bool(self.var_fw_quic.get()),
             "minimize_to_tray": bool(self.var_tray.get()),
+            "disable_browser_doh": bool(self.var_disable_browser_doh.get()),
             "split_dns": bool(self.var_split_dns.get()),
             "split_domains": "\n".join(self.split_domains),
             "direct_dns": self.direct_dns_raw,
@@ -4448,7 +4655,15 @@ class App(tk.Tk):
         ips = [ip for ip, _ in targets]
         desc = f"DoH → {url}" + (f" (через {', '.join(ips)})" if ips else " (резолв из URL)") + split_tag
         if ips:
-            return [DoHUpstream(url, verify=verify, bootstrap_ips=[ip], split_hello=split_hello) for ip in ips], desc
+            fast = len(ips) > 1
+            return [
+                DoHUpstream(
+                    url, verify=verify, bootstrap_ips=[ip],
+                    timeout=(4.0 if fast else 6.0), connect_timeout=(2.5 if fast else 4.0),
+                    split_hello=split_hello,
+                )
+                for ip in ips
+            ], desc
         return [DoHUpstream(url, verify=verify, bootstrap_ips=[], split_hello=split_hello, defer_resolve=True)], desc
 
     # ---------- конфиг ----------
@@ -4554,6 +4769,7 @@ class App(tk.Tk):
             self.var_split_hello.set(bool(cfg.get("split_hello", False)))
             self.var_fw_quic.set(bool(cfg.get("block_fw_quic", False)))
             self.var_tray.set(bool(cfg.get("minimize_to_tray", True)))
+            self.var_disable_browser_doh.set(bool(cfg.get("disable_browser_doh", True)))
             self.var_split_dns.set(bool(cfg.get("split_dns", False)))
             if "split_domains" in cfg:
                 self.split_domains = list(parse_split_domains(cfg.get("split_domains", "")))
@@ -4723,15 +4939,18 @@ class App(tk.Tk):
         split_hello = bool(self.var_split_hello.get())
         block_v6_quic = self.var_block_v6_quic.get()
         fw_quic = bool(self.var_fw_quic.get())
+        disable_browser_doh = bool(self.var_disable_browser_doh.get())
         self._save_config()
         prev_active = self.active_adapter
+        prev_protected = list(self.protected_adapters)
 
         def work():
             nonlocal upstreams
             self.q.put(("log", f"▶ Включаю шифрованный DNS ({desc}) на «{a['name']}»…"))
             k = adapter_key(a)
             pre_v4 = get_dns_servers(k)
-            direct_cand = [ip for ip in (pre_v4 + load_backup(k)) if _valid_ip(ip)]
+            direct_cand = [ip for ip in (pre_v4 + load_backup(k) + _get_windows_gateway_ips(k)) if _valid_ip(ip)]
+            direct_cand = list(dict.fromkeys(direct_cand))
 
             if proto == "auto":
                 for up in upstreams:
@@ -4802,8 +5021,10 @@ class App(tk.Tk):
                     self.q.put(("log", "   Настройки НЕ применены."))
                     return
 
-            # 1. Если защита была включена на другом адаптере — откатим его DNS
-            if prev_active and adapter_key(prev_active) != adapter_key(a):
+            # 1. Если защита была включена на другом адаптере — откатим прежние адаптеры
+            if prev_protected:
+                _restore_extra_adapters(prev_protected, skip_key=k, log_fn=self._thread_log)
+            elif prev_active and adapter_key(prev_active) != k:
                 prev_k = adapter_key(prev_active)
                 if get_dns_servers(prev_k) == [LOCAL_DNS] or get_dns_servers_v6(prev_k) == [LOCAL_DNS_V6]:
                     _, prev_msg = restore_adapter_dns(prev_k)
@@ -4853,30 +5074,122 @@ class App(tk.Tk):
             split_msg = f", раздельный DNS: {len(split_domains)} дом." if proxy.split_enabled else ""
             self.q.put(("log", f"   ✔ Локальный прокси слушает 127.0.0.1:53{v6_msg}{blk_msg}{split_msg}"))
 
-            # 4. Назначаем системный DNS
+            # 4. Назначаем системный DNS (основной + доп. активные адаптеры от обхода)
             target_dns = [LOCAL_DNS, LOCAL_DNS_V6] if (IS_WINDOWS and block_v6_quic and proxy.ipv6_bound) else [LOCAL_DNS]
+            self._active_target_dns = list(target_dns)
             ok, err = set_dns_servers(k, target_dns)
             if not ok:
                 self.q.put(("log", f"   ✘ Ошибка смены DNS адаптера: {err}"))
                 proxy.stop()
                 self.proxy = None
                 self.active_adapter = None
+                self.protected_adapters = []
                 self.q.put(("proxy", None))
                 return
+            extra_adapters = _protect_extra_adapters(k, target_dns, log_fn=self._thread_log)
+            self.protected_adapters = [a] + extra_adapters
             if IS_WINDOWS and fw_quic:
                 ok_fw, msg_fw = set_quic_firewall_block(True)
                 self.q.put(("log", f"   {'✔' if ok_fw else '⚠'} {msg_fw}"))
+            if IS_WINDOWS and disable_browser_doh:
+                bdoh = check_browser_doh_status()
+                if not bdoh.get("policy_off"):
+                    ok_bd, _ = set_browser_doh_policy(True)
+                    if ok_bd:
+                        save_browser_doh_auto_marker(True)
+                        self.q.put(("log", "   ✔ Встроенный DoH браузеров временно отключён (чтобы трафик не шёл мимо)."))
+                        if bdoh.get("local_modes"):
+                            self.q.put(("log", "   ℹ Если браузер уже открыт — перезапустите его!"))
+                self.q.put(("env_status", {
+                    "autostart": self.var_autostart.get(),
+                    "browser_doh": check_browser_doh_status(),
+                }))
             flush_dns_cache()
             cur_v4 = get_dns_servers(k)
             cur_v6 = get_dns_servers_v6(k)
+            bad_v6 = [x for x in cur_v6 if x != LOCAL_DNS_V6]
+            if bad_v6 and block_v6_quic:
+                self.q.put(("log", f"   ⚠ На адаптере остался сторонний IPv6 DNS: {', '.join(bad_v6)}"))
             assigned = " + ".join(cur_v4 + ([LOCAL_DNS_V6] if cur_v6 == [LOCAL_DNS_V6] else [])) or LOCAL_DNS
             self.q.put(("log", f"   DNS адаптера → {assigned}, кэш очищен."))
             if proxy.split_enabled:
                 self.q.put(("log", "✔ Готово! Раздельный DNS работает: список ИИ → шифр, остальное → провайдер."))
             else:
                 self.q.put(("log", "✔ Готово! Весь DNS-трафик шифруется. Нажмите «Проверить»."))
+            self.q.put(("log", "   ℹ Уже открытые браузеры и программы могут держать старые сокеты — при обходе перезапустите их."))
             self.q.put(("status", (a, cur_v4, cur_v6)))
+            self.q.put(("start_watchdog", None))
         self._run_async(work)
+
+    def _schedule_watchdog(self):
+        if self.proxy is not None and not self._watchdog_scheduled:
+            self._watchdog_scheduled = True
+            self.after(15000, self._watchdog_tick)
+
+    def _watchdog_tick(self):
+        self._watchdog_scheduled = False
+        proxy_ref = self.proxy
+        if proxy_ref is None:
+            return
+        self._schedule_watchdog()
+        if self._busy or self._watchdog_busy or not is_admin():
+            return
+        watched = list(self.protected_adapters or ([self.active_adapter] if self.active_adapter else []))
+        primary = self.active_adapter
+        target_dns = list(self._active_target_dns or [LOCAL_DNS])
+        self._watchdog_busy = True
+
+        def work():
+            try:
+                if self.proxy is not proxy_ref or self._busy:
+                    return
+                repaired_any = False
+                live_adapters = get_adapters()
+                live_keys = {adapter_key(x) for x in live_adapters}
+                for ad in watched:
+                    if self.proxy is not proxy_ref or self._busy:
+                        return
+                    ak = adapter_key(ad)
+                    if ak not in live_keys:
+                        continue
+                    cur4 = get_dns_servers(ak)
+                    if cur4 != [LOCAL_DNS]:
+                        cur6 = get_dns_servers_v6(ak)
+                        if cur4:
+                            save_backup(ak, cur4, cur6)
+                        ok_r, err_r = set_dns_servers(ak, target_dns)
+                        if ok_r:
+                            repaired_any = True
+                            self.q.put(("log", f"⚠ Система/DHCP сбросила DNS на «{ad['name']}» — восстановил {LOCAL_DNS} автоматически."))
+                        else:
+                            self.q.put(("log", f"⚠ Сбился DNS на «{ad['name']}», восстановление не прошло: {err_r}"))
+                known_keys = {adapter_key(ad) for ad in watched}
+                for live in live_adapters:
+                    if self.proxy is not proxy_ref or self._busy:
+                        return
+                    lk = adapter_key(live)
+                    if lk in known_keys:
+                        continue
+                    lv4 = get_dns_servers(lk)
+                    lv6 = get_dns_servers_v6(lk)
+                    if not lv4 and not lv6:
+                        continue
+                    if lv4 != [LOCAL_DNS]:
+                        save_backup(lk, lv4, lv6)
+                        ok_n, _ = set_dns_servers(lk, target_dns)
+                        if ok_n:
+                            self.q.put(("add_protected_adapter", live))
+                            repaired_any = True
+                            self.q.put(("log", f"⚠ Появился активный адаптер «{live['name']}» с DNS — перевёл на {LOCAL_DNS}."))
+                if repaired_any and self.proxy is proxy_ref:
+                    flush_dns_cache()
+                    if primary:
+                        pk = adapter_key(primary)
+                        self.q.put(("status", (primary, get_dns_servers(pk), get_dns_servers_v6(pk))))
+            finally:
+                self.q.put(("watchdog_done", None))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _restore_adapter_dns(self, if_index: int):
         return restore_adapter_dns(if_index)
@@ -4907,6 +5220,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "Нужны права администратора.")
             return
         a = self.active_adapter or self._selected_adapter()
+        prev_protected = list(self.protected_adapters)
 
         def work():
             self.q.put(("log", "▶ Отключаю шифрованный DNS…"))
@@ -4916,9 +5230,19 @@ class App(tk.Tk):
                 self.q.put(("proxy", None))
                 self.q.put(("log", "   Локальный прокси остановлен."))
             self.active_adapter = None
+            self.protected_adapters = []
             if IS_WINDOWS and has_quic_firewall_rule():
                 ok_fw, msg_fw = set_quic_firewall_block(False)
                 self.q.put(("log", f"   {'✔' if ok_fw else '⚠'} {msg_fw}"))
+            if IS_WINDOWS and consume_browser_doh_auto_marker():
+                ok_bd, msg_bd = set_browser_doh_policy(False)
+                self.q.put(("log", f"   {'✔' if ok_bd else '⚠'} {msg_bd}"))
+                self.q.put(("env_status", {
+                    "autostart": self.var_autostart.get(),
+                    "browser_doh": check_browser_doh_status(),
+                }))
+            primary_key = adapter_key(a) if a else None
+            _restore_extra_adapters(prev_protected, skip_key=primary_key, log_fn=self._thread_log)
             if a:
                 k = adapter_key(a)
                 ok, msg = self._restore_adapter_dns(k)
@@ -5304,6 +5628,7 @@ def cli_main():
                     return 0
         proxy = None
         active = None
+        protected_adapters = []
 
         def show_status():
             ads = get_adapters()
@@ -5323,7 +5648,7 @@ def cli_main():
                 )
 
         def enable():
-            nonlocal proxy, active
+            nonlocal proxy, active, protected_adapters
             ads = get_adapters()
             if not ads:
                 print("✘ Нет активных адаптеров.")
@@ -5370,7 +5695,9 @@ def cli_main():
                 print(f"  ✘ Ни один апстрим НЕ отвечает: {last_err}")
                 print("  Настройки НЕ применены. Проверьте IP, протокол и сертификат.")
                 return
-            if active and adapter_key(active) != adapter_key(a):
+            if protected_adapters:
+                _restore_extra_adapters(protected_adapters, skip_key=adapter_key(a), log_fn=cli_log)
+            elif active and adapter_key(active) != adapter_key(a):
                 prev_k = adapter_key(active)
                 if get_dns_servers(prev_k) == [LOCAL_DNS] or get_dns_servers_v6(prev_k) == [LOCAL_DNS_V6]:
                     _, prev_msg = restore_adapter_dns(prev_k)
@@ -5415,19 +5742,25 @@ def cli_main():
                 proxy.stop()
                 proxy = None
                 active = None
+                protected_adapters = []
                 return
+            extra_ads = _protect_extra_adapters(key, target_dns, log_fn=cli_log)
+            protected_adapters = [a] + extra_ads
             flush_dns_cache()
             print(f"✔ Шифрованный DNS включён на «{a['name']}»."
                   + (" Режим: раздельный DNS." if proxy.split_enabled else " Весь DNS идёт через TLS."))
 
         def disable():
-            nonlocal proxy, active
+            nonlocal proxy, active, protected_adapters
             if proxy:
                 proxy.stop()
                 proxy = None
                 print("  Прокси остановлен.")
             a = active or (get_adapters() or [None])[0]
+            prev_protected = list(protected_adapters)
             active = None
+            protected_adapters = []
+            _restore_extra_adapters(prev_protected, skip_key=(adapter_key(a) if a else None), log_fn=cli_log)
             if a:
                 k = adapter_key(a)
                 ok, msg = restore_adapter_dns(k)
